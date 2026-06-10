@@ -138,15 +138,16 @@ func runDingTalkConformance(t *testing.T) {
 				}`),
 			},
 			Expect: conformance.InboundExpectation{
-				ChatType:         conformance.ChatTypeGroup,
-				ChatID:           "cid-group",
-				ChatDisplayName:  "Team",
-				ChatIdentityID:   "cid-group",
-				SenderID:         "staff-1",
-				Text:             "hello all",
-				MentionedMe:      &falseValue,
-				MentionAll:       &trueValue,
-				RequireMessageID: true,
+				ChatType:          conformance.ChatTypeGroup,
+				ChatID:            "cid-group",
+				ChatDisplayName:   "Team",
+				ChatIdentityID:    "cid-group",
+				SenderID:          "staff-1",
+				SenderDisplayName: "Alice",
+				Text:              "hello all",
+				MentionedMe:       &falseValue,
+				MentionAll:        &trueValue,
+				RequireMessageID:  true,
 			},
 		}, {
 			Name: "only bot mention follow up is delivered",
@@ -170,14 +171,15 @@ func runDingTalkConformance(t *testing.T) {
 				}`),
 			},
 			Expect: conformance.InboundExpectation{
-				ChatType:         conformance.ChatTypeGroup,
-				ChatID:           "cid-group",
-				ChatDisplayName:  "Team",
-				ChatIdentityID:   "cid-group",
-				SenderID:         "staff-1",
-				TextTrimmedEmpty: &trueValue,
-				MentionedMe:      &trueValue,
-				RequireMessageID: true,
+				ChatType:          conformance.ChatTypeGroup,
+				ChatID:            "cid-group",
+				ChatDisplayName:   "Team",
+				ChatIdentityID:    "cid-group",
+				SenderID:          "staff-1",
+				SenderDisplayName: "Alice",
+				TextTrimmedEmpty:  &trueValue,
+				MentionedMe:       &trueValue,
+				RequireMessageID:  true,
 			},
 		}},
 	})
@@ -397,14 +399,17 @@ func runLarkConformance(t *testing.T) {
 				}`),
 			},
 			Expect: conformance.InboundExpectation{
-				ChatType:         conformance.ChatTypeGroup,
-				ChatID:           "oc_group",
-				ChatIdentityID:   "oc_group",
-				SenderID:         "ou_user",
-				Text:             "hello all",
-				MentionedMe:      &falseValue,
-				MentionAll:       &trueValue,
-				RequireMessageID: true,
+				ChatType:          conformance.ChatTypeGroup,
+				ChatID:            "oc_group",
+				ChatDisplayName:   "Team",
+				ChatAvatarURL:     "https://example.test/team.png",
+				ChatIdentityID:    "oc_group",
+				SenderID:          "ou_user",
+				SenderDisplayName: "Alice",
+				Text:              "hello all",
+				MentionedMe:       &falseValue,
+				MentionAll:        &trueValue,
+				RequireMessageID:  true,
 			},
 		}, {
 			Name: "only bot mention follow up is delivered",
@@ -423,14 +428,17 @@ func runLarkConformance(t *testing.T) {
 				}`),
 			},
 			Expect: conformance.InboundExpectation{
-				ChatType:         conformance.ChatTypeGroup,
-				ChatID:           "oc_group",
-				ChatIdentityID:   "oc_group",
-				SenderID:         "ou_user",
-				TextTrimmedEmpty: &trueValue,
-				MentionedMe:      &trueValue,
-				MentionIDs:       []string{"ou_bot"},
-				RequireMessageID: true,
+				ChatType:          conformance.ChatTypeGroup,
+				ChatID:            "oc_group",
+				ChatDisplayName:   "Team",
+				ChatAvatarURL:     "https://example.test/team.png",
+				ChatIdentityID:    "oc_group",
+				SenderID:          "ou_user",
+				SenderDisplayName: "Alice",
+				TextTrimmedEmpty:  &trueValue,
+				MentionedMe:       &trueValue,
+				MentionIDs:        []string{"ou_bot"},
+				RequireMessageID:  true,
 			},
 		}},
 	})
@@ -474,6 +482,28 @@ func newLarkAdapter(t *testing.T) larkAdapter {
 						"activate_status": 1,
 					},
 				})
+			case "/open-apis/contact/v3/users/ou_user":
+				if got := req.URL.Query().Get("user_id_type"); got != "open_id" {
+					t.Fatalf("lark user_id_type = %q, want open_id", got)
+				}
+				return jsonResponse(map[string]any{
+					"code": 0,
+					"data": map[string]any{
+						"user": map[string]any{
+							"open_id": "ou_user",
+							"name":    "Alice",
+						},
+					},
+				})
+			case "/open-apis/im/v1/chats/oc_group":
+				return jsonResponse(map[string]any{
+					"code": 0,
+					"data": map[string]any{
+						"chat_id":    "oc_group",
+						"name":       "Team",
+						"avatar_url": "https://example.test/team.png",
+					},
+				})
 			default:
 				t.Fatalf("unexpected lark request: %s %s", req.Method, req.URL.Path)
 				return nil, nil
@@ -513,6 +543,7 @@ func (a larkAdapter) ParseInbound(ctx context.Context, fixture conformance.Inbou
 		Account:      account,
 		Gateway:      &larkGateway{},
 		AccountStore: newLarkStore(),
+		HTTPClient:   a.httpClient,
 	}, account, fixture.Raw)
 	if err != nil || result == nil || result.Ignored || result.Inbound == nil {
 		return nil, err
