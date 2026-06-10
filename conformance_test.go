@@ -127,6 +127,7 @@ func runDingTalkConformance(t *testing.T) {
 				Raw: json.RawMessage(`{
 					"conversationType":"2",
 					"conversationId":"cid-group",
+					"conversationTitle":"Team",
 					"senderStaffId":"staff-1",
 					"senderNick":"Alice",
 					"msgId":"msg-at-all-conformance",
@@ -139,6 +140,8 @@ func runDingTalkConformance(t *testing.T) {
 			Expect: conformance.InboundExpectation{
 				ChatType:         conformance.ChatTypeGroup,
 				ChatID:           "cid-group",
+				ChatDisplayName:  "Team",
+				ChatIdentityID:   "cid-group",
 				SenderID:         "staff-1",
 				Text:             "hello all",
 				MentionedMe:      &falseValue,
@@ -155,6 +158,7 @@ func runDingTalkConformance(t *testing.T) {
 				Raw: json.RawMessage(`{
 					"conversationType":"2",
 					"conversationId":"cid-group",
+					"conversationTitle":"Team",
 					"senderStaffId":"staff-1",
 					"senderNick":"Alice",
 					"msgId":"msg-only-bot-conformance",
@@ -168,6 +172,8 @@ func runDingTalkConformance(t *testing.T) {
 			Expect: conformance.InboundExpectation{
 				ChatType:         conformance.ChatTypeGroup,
 				ChatID:           "cid-group",
+				ChatDisplayName:  "Team",
+				ChatIdentityID:   "cid-group",
 				SenderID:         "staff-1",
 				TextTrimmedEmpty: &trueValue,
 				MentionedMe:      &trueValue,
@@ -393,6 +399,7 @@ func runLarkConformance(t *testing.T) {
 			Expect: conformance.InboundExpectation{
 				ChatType:         conformance.ChatTypeGroup,
 				ChatID:           "oc_group",
+				ChatIdentityID:   "oc_group",
 				SenderID:         "ou_user",
 				Text:             "hello all",
 				MentionedMe:      &falseValue,
@@ -418,6 +425,7 @@ func runLarkConformance(t *testing.T) {
 			Expect: conformance.InboundExpectation{
 				ChatType:         conformance.ChatTypeGroup,
 				ChatID:           "oc_group",
+				ChatIdentityID:   "oc_group",
 				SenderID:         "ou_user",
 				TextTrimmedEmpty: &trueValue,
 				MentionedMe:      &trueValue,
@@ -662,6 +670,7 @@ func runWeixinConformance(t *testing.T) {
 			Expect: conformance.InboundExpectation{
 				ChatType:         conformance.ChatTypeGroup,
 				ChatID:           "group-1",
+				ChatIdentityID:   "group-1",
 				SenderID:         "user-1",
 				Text:             "hello all",
 				MentionedMe:      &falseValue,
@@ -694,6 +703,7 @@ func runWeixinConformance(t *testing.T) {
 			Expect: conformance.InboundExpectation{
 				ChatType:         conformance.ChatTypeGroup,
 				ChatID:           "group-1",
+				ChatIdentityID:   "group-1",
 				SenderID:         "user-1",
 				TextTrimmedEmpty: &trueValue,
 				MentionedMe:      &trueValue,
