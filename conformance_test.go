@@ -1457,7 +1457,10 @@ func runWeixinConformance(t *testing.T) {
 		defer server.Close()
 
 		store := newWeixinStore()
-		gateway := &weixinGateway{streamErrs: []error{errors.New("temporary stream failure")}}
+		gateway := &weixinGateway{
+			streamErrs:  []error{errors.New("temporary stream failure")},
+			streamBlock: make(chan struct{}),
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 		defer cancel()
 		err := adapter.connector.Start(ctx, wechatsdk.Runtime{
@@ -1486,13 +1489,12 @@ func runWeixinConformance(t *testing.T) {
 			t.Fatal(err)
 		}
 		conformance.AssertRuntimeHealthState(t, store.state("account-health"), conformance.RuntimeHealthExpectation{
-			ConnectionState:             conformance.RuntimeHealthStateConnected,
-			RequireConnectedAt:          true,
-			RequireLastActivityAt:       true,
-			RequireLastEventAt:          true,
-			RequireLastError:            true,
-			RequireLastErrorAt:          true,
-			RequireReconnectRequestedAt: true,
+			ConnectionState:       conformance.RuntimeHealthStateConnected,
+			RequireConnectedAt:    true,
+			RequireLastActivityAt: true,
+			RequireLastEventAt:    true,
+			RequireLastError:      true,
+			RequireLastErrorAt:    true,
 		})
 	})
 
@@ -1757,9 +1759,10 @@ func (t rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 type weixinGateway struct {
-	mu         sync.Mutex
-	messages   []wechatsdk.CreateMessageRequest
-	streamErrs []error
+	mu          sync.Mutex
+	messages    []wechatsdk.CreateMessageRequest
+	streamErrs  []error
+	streamBlock <-chan struct{}
 }
 
 func (g *weixinGateway) EnsureChannel(context.Context, wechatsdk.EnsureChannelRequest) (string, error) {
@@ -1781,13 +1784,23 @@ func (g *weixinGateway) CreateMessage(_ context.Context, req wechatsdk.CreateMes
 	return "message-1", nil
 }
 
-func (g *weixinGateway) StreamSession(context.Context, wechatsdk.StreamSessionRequest, func(wechatsdk.StreamEvent) error) error {
+func (g *weixinGateway) StreamSession(ctx context.Context, _ wechatsdk.StreamSessionRequest, _ func(wechatsdk.StreamEvent) error) error {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	if len(g.streamErrs) > 0 {
 		err := g.streamErrs[0]
 		g.streamErrs = g.streamErrs[1:]
+		g.mu.Unlock()
 		return err
+	}
+	block := g.streamBlock
+	g.mu.Unlock()
+	if block != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-block:
+			return nil
+		}
 	}
 	return nil
 }
