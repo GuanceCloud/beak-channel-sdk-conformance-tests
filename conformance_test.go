@@ -20,6 +20,9 @@ import (
 	larksdk "github.com/GuanceCloud/beak-agent-channel-lark/sdk"
 	beakweixin "github.com/GuanceCloud/beak-agent-channel-wechat"
 	wechatsdk "github.com/GuanceCloud/beak-agent-channel-wechat/sdk"
+	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
+	dtpayload "github.com/open-dingtalk/dingtalk-stream-sdk-go/payload"
+	dtutils "github.com/open-dingtalk/dingtalk-stream-sdk-go/utils"
 	conformance "gitlab.jiagouyun.com/guance/beak-agent-channel-sdk/beak-channel-sdk-conformance"
 )
 
@@ -86,6 +89,55 @@ func runDingTalkConformance(t *testing.T) {
 		CredentialSchemaProvider: adapter,
 		CredentialValidator:      adapter,
 		InboundParser:            adapter,
+		Acknowledger:             adapter,
+		HostStreamer:             adapter,
+		HostStreamCases: []conformance.HostStreamCase{{
+			Name: "connect, ping, and system frames",
+			Request: conformance.HostStreamConnectRequest{
+				Account: conformance.ChannelAccount{
+					UUID:       "account-stream",
+					Credential: dingtalkCredential("account-stream"),
+					State:      map[string]any{},
+				},
+			},
+			Expect: conformance.HostStreamConnectExpectation{
+				URLContains:            "wss://dingtalk-stream.test/connect?ticket=ticket-conformance",
+				ReadMessageType:        conformance.StreamMessageTypeText,
+				RequirePingInterval:    true,
+				RequirePongTimeout:     true,
+				RequireConnectedHealth: true,
+			},
+			Ping: &conformance.HostStreamPingCase{
+				Expect: conformance.HostStreamPingExpectation{MessageType: conformance.StreamMessageTypePing},
+			},
+			Frames: []conformance.HostStreamFrameCase{{
+				Name: "system ping returns pong and records health",
+				Request: conformance.StreamFrameRequest{
+					MessageType: conformance.StreamMessageTypeText,
+					Data:        dingtalkSystemFrame("ping", "dt-ping-conformance"),
+				},
+				Expect: conformance.HostStreamFrameExpectation{
+					MinResponseFrames:   1,
+					ResponseMessageType: conformance.StreamMessageTypeText,
+					RuntimeHealth: conformance.RuntimeHealthExpectation{
+						RequireLastActivityAt: true,
+						RequireLastPingAt:     true,
+					},
+				},
+			}, {
+				Name: "system disconnect asks host to close",
+				Request: conformance.StreamFrameRequest{
+					MessageType: conformance.StreamMessageTypeText,
+					Data:        dingtalkSystemFrame("disconnect", "dt-disconnect-conformance"),
+				},
+				Expect: conformance.HostStreamFrameExpectation{
+					CloseReason: "disconnect",
+					RuntimeHealth: conformance.RuntimeHealthExpectation{
+						RequireDisconnectedAt: true,
+					},
+				},
+			}},
+		}},
 		CredentialCases: []conformance.CredentialValidationCase{{
 			Name: "valid credential exposes stable account identity",
 			Request: conformance.CredentialValidationRequest{
@@ -182,6 +234,76 @@ func runDingTalkConformance(t *testing.T) {
 				RequireMessageID:  true,
 			},
 		}},
+		AckCases: []conformance.AckCase{{
+			Name: "processing ack is unsupported without sending a message",
+			Request: conformance.OutboundAck{
+				AccountUUID:     "account-1",
+				ChatType:        conformance.ChatTypeGroup,
+				ChatID:          "cid-group",
+				TargetMessageID: "msg-conformance",
+				Action:          "start",
+			},
+			Expect: conformance.AckExpectation{
+				Status: "unsupported",
+				Mode:   "unsupported",
+			},
+		}},
+	})
+
+	t.Run("runtime health start is host-owned and event updates activity", func(t *testing.T) {
+		store := newDingTalkStore()
+		account := dingtalksdk.ChannelAccount{
+			UUID:          "account-health",
+			WorkspaceUUID: "workspace-1",
+			ChannelUUID:   "channel-1",
+			Platform:      beakdingtalk.Platform,
+			Credential:    dingtalkCredential("account-health"),
+			State:         map[string]any{},
+		}
+		startErr := make(chan error, 1)
+		go func() {
+			startErr <- adapter.connector.Start(context.Background(), dingtalksdk.Runtime{
+				WorkspaceUUID: "workspace-1",
+				Channel:       dingtalksdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: beakdingtalk.Platform},
+				Account:       account,
+				Gateway:       &dingtalkGateway{},
+				AccountStore:  store,
+			})
+		}()
+		select {
+		case err := <-startErr:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("dingtalk Start blocked; stream connection must stay host-owned")
+		}
+		_, err := adapter.event.HandleEvent(context.Background(), dingtalksdk.Runtime{
+			WorkspaceUUID: "workspace-1",
+			Channel:       dingtalksdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: beakdingtalk.Platform},
+			Account:       account,
+			Gateway:       &dingtalkGateway{},
+			AccountStore:  store,
+		}, account, []byte(`{
+			"conversationType":"2",
+			"conversationId":"cid-health",
+			"conversationTitle":"Team",
+			"senderStaffId":"staff-1",
+			"senderNick":"Alice",
+			"msgId":"msg-health",
+			"msgtype":"text",
+			"isInAtList":true,
+			"text":{"content":"hello","at":{}},
+			"chatbotUserId":"bot-1",
+			"robotCode":"robot-1"
+		}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		conformance.AssertRuntimeHealthState(t, store.state("account-health"), conformance.RuntimeHealthExpectation{
+			RequireLastActivityAt: true,
+			RequireLastEventAt:    true,
+		})
 	})
 }
 
@@ -189,6 +311,7 @@ type dingtalkAdapter struct {
 	t          *testing.T
 	connector  dingtalksdk.Connector
 	event      beakdingtalk.EventConnector
+	hostStream dingtalksdk.HostStreamConnector
 	httpClient *http.Client
 }
 
@@ -199,22 +322,42 @@ func newDingTalkAdapter(t *testing.T) dingtalkAdapter {
 	if !ok {
 		t.Fatal("dingtalk connector should expose EventConnector")
 	}
+	hostStream, ok := connector.(dingtalksdk.HostStreamConnector)
+	if !ok {
+		t.Fatal("dingtalk connector should expose HostStreamConnector")
+	}
 	return dingtalkAdapter{
-		t:         t,
-		connector: connector,
-		event:     event,
+		t:          t,
+		connector:  connector,
+		event:      event,
+		hostStream: hostStream,
 		httpClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			if req.URL.Path != "/v1.0/oauth2/accessToken" {
+			switch req.URL.Path {
+			case "/v1.0/oauth2/accessToken":
+				var body map[string]string
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if body["appSecret"] == "bad" {
+					return jsonResponse(map[string]any{"code": "InvalidAppSecret", "message": "bad secret"})
+				}
+				return jsonResponse(map[string]any{"accessToken": "access-token-conformance", "expireIn": 3600})
+			case "/v1.0/gateway/connections/open":
+				var body map[string]any
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if body["clientId"] != "client-1" || body["clientSecret"] != "secret-1" {
+					t.Fatalf("unexpected dingtalk stream credential body=%+v", body)
+				}
+				return jsonResponse(map[string]any{
+					"endpoint": "wss://dingtalk-stream.test/connect",
+					"ticket":   "ticket-conformance",
+				})
+			default:
 				t.Fatalf("unexpected dingtalk request: %s %s", req.Method, req.URL.Path)
+				return nil, nil
 			}
-			var body map[string]string
-			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-				t.Fatal(err)
-			}
-			if body["appSecret"] == "bad" {
-				return jsonResponse(map[string]any{"code": "InvalidAppSecret", "message": "bad secret"})
-			}
-			return jsonResponse(map[string]any{"accessToken": "access-token-conformance", "expireIn": 3600})
 		})},
 	}
 }
@@ -257,6 +400,67 @@ func (a dingtalkAdapter) ParseInbound(ctx context.Context, fixture conformance.I
 	return []conformance.InboundMessage{convert[conformance.InboundMessage](a.t, result.Inbound)}, nil
 }
 
+func (a dingtalkAdapter) Acknowledge(ctx context.Context, req conformance.OutboundAck) (*conformance.AckResult, error) {
+	sdkReq := convert[dingtalksdk.OutboundAck](a.t, req)
+	account := dingtalksdk.ChannelAccount{
+		UUID:       firstString(req.AccountUUID, "account-1"),
+		Platform:   beakdingtalk.Platform,
+		Credential: dingtalkCredential(firstString(req.AccountUUID, "account-1")),
+	}
+	result, err := a.connector.Acknowledge(ctx, dingtalksdk.Runtime{
+		Account:    account,
+		HTTPClient: a.httpClient,
+	}, sdkReq)
+	if result == nil {
+		return nil, err
+	}
+	out := convert[conformance.AckResult](a.t, result)
+	return &out, err
+}
+
+func (a dingtalkAdapter) ConnectStream(ctx context.Context, req conformance.HostStreamConnectRequest) (*conformance.StreamConnectResult, error) {
+	account := dingtalkStreamAccount(req)
+	result, err := a.hostStream.ConnectStream(ctx, dingtalkRuntime(req.WorkspaceUUID, req.ChannelUUID, account, a.httpClient), account)
+	if result == nil {
+		return nil, err
+	}
+	return &conformance.StreamConnectResult{
+		URL:             result.URL,
+		Headers:         result.Headers,
+		ServiceID:       result.ServiceID,
+		ReadMessageType: result.ReadMessageType,
+		PingInterval:    result.PingInterval,
+		PongTimeout:     result.PongTimeout,
+		State:           result.State,
+		HealthUpdates:   result.HealthUpdates,
+	}, err
+}
+
+func (a dingtalkAdapter) BuildStreamPing(ctx context.Context, req conformance.StreamPingRequest) (*conformance.StreamFrame, error) {
+	result, err := a.hostStream.BuildStreamPing(ctx, dingtalksdk.StreamPingRequest{
+		ServiceID: req.ServiceID,
+		State:     req.State,
+	})
+	if result == nil {
+		return nil, err
+	}
+	return &conformance.StreamFrame{MessageType: result.MessageType, Data: result.Data}, err
+}
+
+func (a dingtalkAdapter) HandleStreamFrame(ctx context.Context, req conformance.StreamFrameRequest) (*conformance.StreamFrameResult, error) {
+	account := dingtalkFrameAccount(req)
+	result, err := a.hostStream.HandleStreamFrame(ctx, dingtalkRuntime(req.WorkspaceUUID, req.ChannelUUID, account, a.httpClient), account, dingtalksdk.StreamFrameRequest{
+		MessageType: req.MessageType,
+		Data:        req.Data,
+		ServiceID:   req.ServiceID,
+		State:       req.State,
+	})
+	if result == nil {
+		return nil, err
+	}
+	return dingtalkStreamFrameResult(a.t, result), err
+}
+
 func dingtalkAccount(fixture conformance.InboundFixture) dingtalksdk.ChannelAccount {
 	credential := fixture.Credential
 	if len(credential) == 0 {
@@ -272,6 +476,85 @@ func dingtalkAccount(fixture conformance.InboundFixture) dingtalksdk.ChannelAcco
 	}
 }
 
+func dingtalkStreamAccount(req conformance.HostStreamConnectRequest) dingtalksdk.ChannelAccount {
+	credential := req.Account.Credential
+	if len(credential) == 0 {
+		credential = req.Credential
+	}
+	if len(credential) == 0 {
+		credential = dingtalkCredential(firstString(req.Account.UUID, "account-1"))
+	}
+	state := req.Account.State
+	if state == nil {
+		state = req.State
+	}
+	return dingtalksdk.ChannelAccount{
+		UUID:          firstString(req.Account.UUID, "account-1"),
+		WorkspaceUUID: firstString(req.Account.WorkspaceUUID, req.WorkspaceUUID, "workspace-1"),
+		ChannelUUID:   firstString(req.Account.ChannelUUID, req.ChannelUUID, "channel-1"),
+		Platform:      beakdingtalk.Platform,
+		Credential:    credential,
+		State:         state,
+	}
+}
+
+func dingtalkFrameAccount(req conformance.StreamFrameRequest) dingtalksdk.ChannelAccount {
+	connectReq := conformance.HostStreamConnectRequest{
+		WorkspaceUUID: req.WorkspaceUUID,
+		ChannelUUID:   req.ChannelUUID,
+		Account:       req.Account,
+		Credential:    req.Credential,
+	}
+	return dingtalkStreamAccount(connectReq)
+}
+
+func dingtalkRuntime(workspaceUUID, channelUUID string, account dingtalksdk.ChannelAccount, httpClient *http.Client) dingtalksdk.Runtime {
+	workspaceUUID = firstString(workspaceUUID, account.WorkspaceUUID, "workspace-1")
+	channelUUID = firstString(channelUUID, account.ChannelUUID, "channel-1")
+	return dingtalksdk.Runtime{
+		WorkspaceUUID: workspaceUUID,
+		Channel:       dingtalksdk.Channel{UUID: channelUUID, WorkspaceUUID: workspaceUUID, Platform: beakdingtalk.Platform},
+		Account:       account,
+		Gateway:       &dingtalkGateway{},
+		AccountStore:  newDingTalkStore(),
+		HTTPClient:    httpClient,
+	}
+}
+
+func dingtalkStreamFrameResult(t *testing.T, result *dingtalksdk.StreamFrameResult) *conformance.StreamFrameResult {
+	t.Helper()
+	out := &conformance.StreamFrameResult{
+		HealthUpdates: result.HealthUpdates,
+		CloseReason:   result.CloseReason,
+		State:         result.State,
+	}
+	for _, frame := range result.ResponseFrames {
+		out.ResponseFrames = append(out.ResponseFrames, conformance.StreamFrame{
+			MessageType: frame.MessageType,
+			Data:        frame.Data,
+		})
+	}
+	if result.EventResult != nil {
+		event := convert[conformance.StreamEventResult](t, result.EventResult)
+		out.EventResult = &event
+	}
+	return out
+}
+
+func dingtalkSystemFrame(topic, messageID string) []byte {
+	frame := &dtpayload.DataFrame{
+		SpecVersion: "1.0",
+		Type:        dtutils.SubscriptionTypeKSystem,
+		Time:        time.Now().UnixMilli(),
+		Headers: dtpayload.DataFrameHeader{
+			dtpayload.DataFrameHeaderKTopic:     topic,
+			dtpayload.DataFrameHeaderKMessageId: messageID,
+		},
+		Data: "{}",
+	}
+	return frame.Encode()
+}
+
 func dingtalkCredential(accountUUID string) map[string]any {
 	return map[string]any{
 		"account_id":      firstString(accountUUID, "account-1"),
@@ -280,6 +563,7 @@ func dingtalkCredential(accountUUID string) map[string]any {
 		"robot_code":      "robot-1",
 		"chatbot_user_id": "bot-1",
 		"chatbot_corp_id": "corp-1",
+		"base_url":        "https://dingtalk.test",
 	}
 }
 
@@ -341,6 +625,16 @@ func (s *dingtalkStore) SaveChannelAccountState(_ context.Context, accountUUID s
 	return nil
 }
 
+func (s *dingtalkStore) state(accountUUID string) map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]any, len(s.states[accountUUID]))
+	for key, value := range s.states[accountUUID] {
+		out[key] = value
+	}
+	return out
+}
+
 func runLarkConformance(t *testing.T) {
 	adapter := newLarkAdapter(t)
 	trueValue := true
@@ -352,6 +646,63 @@ func runLarkConformance(t *testing.T) {
 		CredentialSchemaProvider: adapter,
 		CredentialValidator:      adapter,
 		InboundParser:            adapter,
+		Acknowledger:             adapter,
+		HostStreamer:             adapter,
+		HostStreamCases: []conformance.HostStreamCase{{
+			Name: "connect, ping, control pong, and event frame",
+			Request: conformance.HostStreamConnectRequest{
+				Account: conformance.ChannelAccount{
+					UUID:       "account-stream",
+					Credential: larkCredential("account-stream"),
+					State:      map[string]any{},
+				},
+			},
+			Expect: conformance.HostStreamConnectExpectation{
+				URLContains:            "wss://lark-stream.test/ws",
+				ReadMessageType:        conformance.StreamMessageTypeBinary,
+				RequireServiceID:       true,
+				RequirePingInterval:    true,
+				RequirePongTimeout:     true,
+				RequireState:           true,
+				RequireConnectedHealth: true,
+			},
+			Ping: &conformance.HostStreamPingCase{
+				Expect: conformance.HostStreamPingExpectation{
+					MessageType: conformance.StreamMessageTypeBinary,
+					RequireData: true,
+				},
+			},
+			Frames: []conformance.HostStreamFrameCase{{
+				Name: "control pong updates heartbeat health",
+				Request: conformance.StreamFrameRequest{
+					MessageType: conformance.StreamMessageTypeBinary,
+					Data:        larkControlPongFrame(t),
+				},
+				Expect: conformance.HostStreamFrameExpectation{
+					RequireFrameState: true,
+					RuntimeHealth: conformance.RuntimeHealthExpectation{
+						RequireLastActivityAt: true,
+						RequireLastPongAt:     true,
+					},
+				},
+			}, {
+				Name: "event frame creates message and returns ack frame",
+				Request: conformance.StreamFrameRequest{
+					MessageType: conformance.StreamMessageTypeBinary,
+					Data:        larkStreamEventFrame(t, "lark-stream-message-conformance"),
+				},
+				Expect: conformance.HostStreamFrameExpectation{
+					MinResponseFrames:   1,
+					ResponseMessageType: conformance.StreamMessageTypeBinary,
+					RequireEventResult:  true,
+					EventType:           "im.message.receive_v1",
+					RuntimeHealth: conformance.RuntimeHealthExpectation{
+						RequireLastActivityAt: true,
+						RequireLastEventAt:    true,
+					},
+				},
+			}},
+		}},
 		CredentialCases: []conformance.CredentialValidationCase{{
 			Name: "valid credential exposes stable account identity",
 			Request: conformance.CredentialValidationRequest{
@@ -441,6 +792,75 @@ func runLarkConformance(t *testing.T) {
 				RequireMessageID:  true,
 			},
 		}},
+		AckCases: []conformance.AckCase{{
+			Name: "processing ack adds lark reaction",
+			Request: conformance.OutboundAck{
+				AccountUUID:     "account-1",
+				ChatType:        conformance.ChatTypeGroup,
+				ChatID:          "oc_group",
+				TargetMessageID: "om_conformance",
+				Action:          "start",
+				Emoji:           "thinking",
+			},
+			Expect: conformance.AckExpectation{
+				Status:     "sent",
+				Mode:       "reaction",
+				ReactionID: "reaction-conformance",
+			},
+		}},
+	})
+
+	t.Run("runtime health start is host-owned and event updates activity", func(t *testing.T) {
+		store := newLarkStore()
+		account := larksdk.ChannelAccount{
+			UUID:          "account-health",
+			WorkspaceUUID: "workspace-1",
+			ChannelUUID:   "channel-1",
+			Platform:      beaklark.Platform,
+			Credential:    larkCredential("account-health"),
+			State:         map[string]any{},
+		}
+		startErr := make(chan error, 1)
+		go func() {
+			startErr <- adapter.connector.Start(context.Background(), larksdk.Runtime{
+				WorkspaceUUID: "workspace-1",
+				Channel:       larksdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: beaklark.Platform},
+				Account:       account,
+				Gateway:       &larkGateway{},
+				AccountStore:  store,
+				HTTPClient:    adapter.httpClient,
+			})
+		}()
+		select {
+		case err := <-startErr:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("lark Start blocked; WebSocket client must stay host-owned")
+		}
+		_, err := adapter.event.HandleEvent(context.Background(), larksdk.Runtime{
+			WorkspaceUUID: "workspace-1",
+			Channel:       larksdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: beaklark.Platform},
+			Account:       account,
+			Gateway:       &larkGateway{},
+			AccountStore:  store,
+			HTTPClient:    adapter.httpClient,
+		}, account, []byte(`{
+			"schema":"2.0",
+			"header":{"event_id":"evt_health","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
+			"event":{
+				"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+				"message":{"message_id":"om_health","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"@_bot hello\"}","create_time":"1770000000000","mentions":[{"key":"@_bot","id":{"open_id":"ou_bot"},"name":"Beak Bot"}]}
+			}
+		}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		conformance.AssertRuntimeHealthState(t, store.state("account-health"), conformance.RuntimeHealthExpectation{
+			RequireLastActivityAt: true,
+			RequireLastEventAt:    true,
+		})
 	})
 }
 
@@ -448,6 +868,8 @@ type larkAdapter struct {
 	t          *testing.T
 	connector  larksdk.Connector
 	webhook    beaklark.WebhookConnector
+	event      beaklark.EventConnector
+	hostStream larksdk.HostStreamConnector
 	httpClient *http.Client
 }
 
@@ -458,10 +880,20 @@ func newLarkAdapter(t *testing.T) larkAdapter {
 	if !ok {
 		t.Fatal("lark connector should expose WebhookConnector")
 	}
+	event, ok := connector.(beaklark.EventConnector)
+	if !ok {
+		t.Fatal("lark connector should expose EventConnector")
+	}
+	hostStream, ok := connector.(larksdk.HostStreamConnector)
+	if !ok {
+		t.Fatal("lark connector should expose HostStreamConnector")
+	}
 	return larkAdapter{
-		t:         t,
-		connector: connector,
-		webhook:   webhook,
+		t:          t,
+		connector:  connector,
+		webhook:    webhook,
+		event:      event,
+		hostStream: hostStream,
 		httpClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.Path {
 			case "/open-apis/auth/v3/tenant_access_token/internal":
@@ -473,6 +905,24 @@ func newLarkAdapter(t *testing.T) larkAdapter {
 					return jsonResponse(map[string]any{"code": 999, "msg": "bad secret"})
 				}
 				return jsonResponse(map[string]any{"code": 0, "tenant_access_token": "tenant-token-conformance", "expire": 3600})
+			case "/callback/ws/endpoint":
+				var body map[string]string
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if body["AppID"] != "cli_1" || body["AppSecret"] != "secret_1" {
+					t.Fatalf("unexpected lark stream credential body=%+v", body)
+				}
+				return jsonResponse(map[string]any{
+					"code": 0,
+					"msg":  "ok",
+					"data": map[string]any{
+						"URL": "wss://lark-stream.test/ws?service_id=42",
+						"ClientConfig": map[string]any{
+							"PingInterval": 1,
+						},
+					},
+				})
 			case "/open-apis/bot/v3/info":
 				return jsonResponse(map[string]any{
 					"code": 0,
@@ -502,6 +952,28 @@ func newLarkAdapter(t *testing.T) larkAdapter {
 						"chat_id":    "oc_group",
 						"name":       "Team",
 						"avatar_url": "https://example.test/team.png",
+					},
+				})
+			case "/open-apis/im/v1/messages/om_conformance/reactions":
+				var body struct {
+					ReactionType struct {
+						EmojiType string `json:"emoji_type"`
+					} `json:"reaction_type"`
+				}
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if body.ReactionType.EmojiType != "THINKING" {
+					t.Fatalf("lark reaction emoji=%q", body.ReactionType.EmojiType)
+				}
+				return jsonResponse(map[string]any{
+					"code": 0,
+					"data": map[string]any{
+						"reaction_id": "reaction-conformance",
+						"reaction_type": map[string]any{
+							"emoji_type": "THINKING",
+						},
+						"action_time": "1770000000000",
 					},
 				})
 			default:
@@ -551,6 +1023,67 @@ func (a larkAdapter) ParseInbound(ctx context.Context, fixture conformance.Inbou
 	return []conformance.InboundMessage{convert[conformance.InboundMessage](a.t, result.Inbound)}, nil
 }
 
+func (a larkAdapter) Acknowledge(ctx context.Context, req conformance.OutboundAck) (*conformance.AckResult, error) {
+	sdkReq := convert[larksdk.OutboundAck](a.t, req)
+	account := larksdk.ChannelAccount{
+		UUID:       firstString(req.AccountUUID, "account-1"),
+		Platform:   beaklark.Platform,
+		Credential: larkCredential(firstString(req.AccountUUID, "account-1")),
+	}
+	result, err := a.connector.Acknowledge(ctx, larksdk.Runtime{
+		Account:    account,
+		HTTPClient: a.httpClient,
+	}, sdkReq)
+	if result == nil {
+		return nil, err
+	}
+	out := convert[conformance.AckResult](a.t, result)
+	return &out, err
+}
+
+func (a larkAdapter) ConnectStream(ctx context.Context, req conformance.HostStreamConnectRequest) (*conformance.StreamConnectResult, error) {
+	account := larkStreamAccount(req)
+	result, err := a.hostStream.ConnectStream(ctx, larkRuntime(req.WorkspaceUUID, req.ChannelUUID, account, a.httpClient), account)
+	if result == nil {
+		return nil, err
+	}
+	return &conformance.StreamConnectResult{
+		URL:             result.URL,
+		Headers:         result.Headers,
+		ServiceID:       result.ServiceID,
+		ReadMessageType: result.ReadMessageType,
+		PingInterval:    result.PingInterval,
+		PongTimeout:     result.PongTimeout,
+		State:           result.State,
+		HealthUpdates:   result.HealthUpdates,
+	}, err
+}
+
+func (a larkAdapter) BuildStreamPing(ctx context.Context, req conformance.StreamPingRequest) (*conformance.StreamFrame, error) {
+	result, err := a.hostStream.BuildStreamPing(ctx, larksdk.StreamPingRequest{
+		ServiceID: req.ServiceID,
+		State:     req.State,
+	})
+	if result == nil {
+		return nil, err
+	}
+	return &conformance.StreamFrame{MessageType: result.MessageType, Data: result.Data}, err
+}
+
+func (a larkAdapter) HandleStreamFrame(ctx context.Context, req conformance.StreamFrameRequest) (*conformance.StreamFrameResult, error) {
+	account := larkFrameAccount(req)
+	result, err := a.hostStream.HandleStreamFrame(ctx, larkRuntime(req.WorkspaceUUID, req.ChannelUUID, account, a.httpClient), account, larksdk.StreamFrameRequest{
+		MessageType: req.MessageType,
+		Data:        req.Data,
+		ServiceID:   req.ServiceID,
+		State:       req.State,
+	})
+	if result == nil {
+		return nil, err
+	}
+	return larkStreamFrameResult(a.t, result), err
+}
+
 func larkAccount(fixture conformance.InboundFixture) larksdk.ChannelAccount {
 	credential := fixture.Credential
 	if len(credential) == 0 {
@@ -564,6 +1097,122 @@ func larkAccount(fixture conformance.InboundFixture) larksdk.ChannelAccount {
 		Credential:    credential,
 		State:         fixture.AccountState,
 	}
+}
+
+func larkStreamAccount(req conformance.HostStreamConnectRequest) larksdk.ChannelAccount {
+	credential := req.Account.Credential
+	if len(credential) == 0 {
+		credential = req.Credential
+	}
+	if len(credential) == 0 {
+		credential = larkCredential(firstString(req.Account.UUID, "account-1"))
+	}
+	state := req.Account.State
+	if state == nil {
+		state = req.State
+	}
+	return larksdk.ChannelAccount{
+		UUID:          firstString(req.Account.UUID, "account-1"),
+		WorkspaceUUID: firstString(req.Account.WorkspaceUUID, req.WorkspaceUUID, "workspace-1"),
+		ChannelUUID:   firstString(req.Account.ChannelUUID, req.ChannelUUID, "channel-1"),
+		Platform:      beaklark.Platform,
+		Credential:    credential,
+		State:         state,
+	}
+}
+
+func larkFrameAccount(req conformance.StreamFrameRequest) larksdk.ChannelAccount {
+	connectReq := conformance.HostStreamConnectRequest{
+		WorkspaceUUID: req.WorkspaceUUID,
+		ChannelUUID:   req.ChannelUUID,
+		Account:       req.Account,
+		Credential:    req.Credential,
+	}
+	return larkStreamAccount(connectReq)
+}
+
+func larkRuntime(workspaceUUID, channelUUID string, account larksdk.ChannelAccount, httpClient *http.Client) larksdk.Runtime {
+	workspaceUUID = firstString(workspaceUUID, account.WorkspaceUUID, "workspace-1")
+	channelUUID = firstString(channelUUID, account.ChannelUUID, "channel-1")
+	return larksdk.Runtime{
+		WorkspaceUUID: workspaceUUID,
+		Channel:       larksdk.Channel{UUID: channelUUID, WorkspaceUUID: workspaceUUID, Platform: beaklark.Platform},
+		Account:       account,
+		Gateway:       &larkGateway{},
+		AccountStore:  newLarkStore(),
+		HTTPClient:    httpClient,
+	}
+}
+
+func larkStreamFrameResult(t *testing.T, result *larksdk.StreamFrameResult) *conformance.StreamFrameResult {
+	t.Helper()
+	out := &conformance.StreamFrameResult{
+		HealthUpdates: result.HealthUpdates,
+		CloseReason:   result.CloseReason,
+		State:         result.State,
+	}
+	for _, frame := range result.ResponseFrames {
+		out.ResponseFrames = append(out.ResponseFrames, conformance.StreamFrame{
+			MessageType: frame.MessageType,
+			Data:        frame.Data,
+		})
+	}
+	if result.EventResult != nil {
+		event := convert[conformance.StreamEventResult](t, result.EventResult)
+		out.EventResult = &event
+	}
+	return out
+}
+
+func larkControlPongFrame(t *testing.T) []byte {
+	t.Helper()
+	frame := larkws.Frame{
+		Method: int32(larkws.FrameTypeControl),
+		Headers: []larkws.Header{{
+			Key:   larkws.HeaderType,
+			Value: string(larkws.MessageTypePong),
+		}},
+		Payload: []byte(`{"PingInterval":1}`),
+	}
+	data, err := frame.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func larkStreamEventFrame(t *testing.T, messageID string) []byte {
+	t.Helper()
+	payload := []byte(`{
+		"schema":"2.0",
+		"header":{"event_id":"evt_stream_conformance","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
+		"event":{
+			"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+			"message":{"message_id":"om_stream_conformance","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"@_bot hello from stream\"}","create_time":"1770000000000","mentions":[{"key":"@_bot","id":{"open_id":"ou_bot"},"name":"Beak Bot"}]}
+		}
+	}`)
+	frame := larkws.Frame{
+		Method: int32(larkws.FrameTypeData),
+		Headers: []larkws.Header{{
+			Key:   larkws.HeaderType,
+			Value: string(larkws.MessageTypeEvent),
+		}, {
+			Key:   larkws.HeaderMessageID,
+			Value: messageID,
+		}, {
+			Key:   larkws.HeaderSum,
+			Value: "1",
+		}, {
+			Key:   larkws.HeaderSeq,
+			Value: "0",
+		}},
+		Payload: payload,
+	}
+	data, err := frame.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 func larkCredential(accountUUID string) map[string]any {
@@ -629,6 +1278,16 @@ func (s *larkStore) SaveChannelAccountState(_ context.Context, accountUUID strin
 	return nil
 }
 
+func (s *larkStore) state(accountUUID string) map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]any, len(s.states[accountUUID]))
+	for key, value := range s.states[accountUUID] {
+		out[key] = value
+	}
+	return out
+}
+
 func runWeixinConformance(t *testing.T) {
 	adapter := newWeixinAdapter(t)
 	defer adapter.loginSrv.Close()
@@ -643,6 +1302,7 @@ func runWeixinConformance(t *testing.T) {
 		CredentialValidator:      adapter,
 		LoginPoller:              adapter,
 		InboundParser:            adapter,
+		Acknowledger:             adapter,
 		CredentialCases: []conformance.CredentialValidationCase{{
 			Name: "valid credential exposes stable account identity",
 			Request: conformance.CredentialValidationRequest{
@@ -743,6 +1403,145 @@ func runWeixinConformance(t *testing.T) {
 				RequireDedupeKey: true,
 			},
 		}},
+		AckCases: []conformance.AckCase{{
+			Name: "processing ack sends weixin typing",
+			Request: conformance.OutboundAck{
+				AccountUUID: "account-1",
+				ChatType:    conformance.ChatTypeGroup,
+				ChatID:      "group-conformance",
+				Action:      "start",
+			},
+			Expect: conformance.AckExpectation{
+				Status: "sent",
+				Mode:   "typing",
+			},
+		}},
+	})
+
+	t.Run("runtime health records poll errors and recovered activity", func(t *testing.T) {
+		var getUpdatesCalls int
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/ilink/bot/msg/notifystart", "/ilink/bot/msg/notifystop":
+				_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0})
+			case "/ilink/bot/getupdates":
+				getUpdatesCalls++
+				if getUpdatesCalls == 1 {
+					_ = json.NewEncoder(w).Encode(map[string]any{"ret": 1, "errmsg": "temporary getupdates failure"})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"ret":             0,
+					"get_updates_buf": "buf-health",
+					"msgs": []map[string]any{{
+						"message_id":    401,
+						"from_user_id":  "user-1",
+						"to_user_id":    "bot-1",
+						"message_type":  1,
+						"message_state": 2,
+						"context_token": "ctx-health",
+						"item_list": []map[string]any{{
+							"type":      1,
+							"text_item": map[string]any{"text": "hello health"},
+						}},
+					}},
+				})
+			case "/ilink/bot/getconfig":
+				_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0, "typing_ticket": "typing-ticket-conformance"})
+			case "/ilink/bot/sendtyping":
+				_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0})
+			default:
+				t.Fatalf("unexpected weixin request: %s %s", r.Method, r.URL.Path)
+			}
+		}))
+		defer server.Close()
+
+		store := newWeixinStore()
+		gateway := &weixinGateway{streamErrs: []error{errors.New("temporary stream failure")}}
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
+		err := adapter.connector.Start(ctx, wechatsdk.Runtime{
+			WorkspaceUUID: "workspace-1",
+			Channel:       wechatsdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: beakweixin.Platform},
+			Account: wechatsdk.ChannelAccount{
+				UUID:          "account-health",
+				WorkspaceUUID: "workspace-1",
+				ChannelUUID:   "channel-1",
+				Platform:      beakweixin.Platform,
+				Credential: map[string]any{
+					"account_id":    "account-health",
+					"bot_token":     "token-conformance",
+					"base_url":      server.URL,
+					"ilink_user_id": "ilink-user-conformance",
+					"ilink_bot_id":  "ilink-bot-conformance",
+				},
+				State: map[string]any{},
+			},
+			Gateway:         gateway,
+			AccountStore:    store,
+			PollInterval:    time.Millisecond,
+			StreamReconnect: time.Millisecond,
+		})
+		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatal(err)
+		}
+		conformance.AssertRuntimeHealthState(t, store.state("account-health"), conformance.RuntimeHealthExpectation{
+			ConnectionState:             conformance.RuntimeHealthStateConnected,
+			RequireConnectedAt:          true,
+			RequireLastActivityAt:       true,
+			RequireLastEventAt:          true,
+			RequireLastError:            true,
+			RequireLastErrorAt:          true,
+			RequireReconnectRequestedAt: true,
+		})
+	})
+
+	t.Run("runtime health records expired poll session", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/ilink/bot/msg/notifystart", "/ilink/bot/msg/notifystop":
+				_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0})
+			case "/ilink/bot/getupdates":
+				_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0, "errcode": -14, "errmsg": "expired"})
+			default:
+				t.Fatalf("unexpected weixin request: %s %s", r.Method, r.URL.Path)
+			}
+		}))
+		defer server.Close()
+
+		store := newWeixinStore()
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
+		err := adapter.connector.Start(ctx, wechatsdk.Runtime{
+			WorkspaceUUID: "workspace-1",
+			Channel:       wechatsdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: beakweixin.Platform},
+			Account: wechatsdk.ChannelAccount{
+				UUID:          "account-expired",
+				WorkspaceUUID: "workspace-1",
+				ChannelUUID:   "channel-1",
+				Platform:      beakweixin.Platform,
+				Credential: map[string]any{
+					"account_id":    "account-expired",
+					"bot_token":     "token-conformance",
+					"base_url":      server.URL,
+					"ilink_user_id": "ilink-user-conformance",
+					"ilink_bot_id":  "ilink-bot-conformance",
+				},
+				State: map[string]any{},
+			},
+			Gateway:      &weixinGateway{},
+			AccountStore: store,
+		})
+		if err == nil || !strings.Contains(err.Error(), "session expired") {
+			t.Fatalf("expected expired session error, got %v", err)
+		}
+		trueValue := true
+		conformance.AssertRuntimeHealthState(t, store.state("account-expired"), conformance.RuntimeHealthExpectation{
+			ConnectionState:    conformance.RuntimeHealthStateExpired,
+			RequireLastError:   true,
+			RequireLastErrorAt: true,
+			SessionExpired:     &trueValue,
+		})
 	})
 }
 
@@ -879,6 +1678,69 @@ func (a weixinAdapter) ParseInbound(ctx context.Context, fixture conformance.Inb
 	return out, nil
 }
 
+func (a weixinAdapter) Acknowledge(ctx context.Context, req conformance.OutboundAck) (*conformance.AckResult, error) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ilink/bot/getconfig":
+			var body struct {
+				ILinkUserID  string `json:"ilink_user_id"`
+				ContextToken string `json:"context_token"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				a.t.Fatal(err)
+			}
+			if body.ILinkUserID != req.ChatID || body.ContextToken != "ctx-conformance" {
+				a.t.Fatalf("weixin getconfig body=%+v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0, "typing_ticket": "typing-ticket-conformance"})
+		case "/ilink/bot/sendtyping":
+			var body struct {
+				ILinkUserID  string `json:"ilink_user_id"`
+				TypingTicket string `json:"typing_ticket"`
+				Status       int    `json:"status"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				a.t.Fatal(err)
+			}
+			if body.ILinkUserID != req.ChatID || body.TypingTicket != "typing-ticket-conformance" || body.Status != 1 {
+				a.t.Fatalf("weixin sendtyping body=%+v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0})
+		default:
+			a.t.Fatalf("unexpected weixin ack request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	sdkReq := convert[wechatsdk.OutboundAck](a.t, req)
+	contextKey := req.ChatID
+	if req.ChatType == conformance.ChatTypeGroup {
+		contextKey = "group:" + req.ChatID
+	}
+	account := wechatsdk.ChannelAccount{
+		UUID:     firstString(req.AccountUUID, "account-1"),
+		Platform: beakweixin.Platform,
+		Credential: map[string]any{
+			"account_id":    firstString(req.AccountUUID, "account-1"),
+			"bot_token":     "token-conformance",
+			"base_url":      server.URL,
+			"ilink_user_id": "ilink-user-conformance",
+			"ilink_bot_id":  "ilink-bot-conformance",
+		},
+		State: map[string]any{
+			"context_tokens": map[string]any{
+				contextKey: "ctx-conformance",
+			},
+		},
+	}
+	result, err := a.connector.Acknowledge(ctx, wechatsdk.Runtime{Account: account}, sdkReq)
+	if result == nil {
+		return nil, err
+	}
+	out := convert[conformance.AckResult](a.t, result)
+	return &out, err
+}
+
 type rewriteTransport struct {
 	target *url.URL
 	base   http.RoundTripper
@@ -895,8 +1757,9 @@ func (t rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 type weixinGateway struct {
-	mu       sync.Mutex
-	messages []wechatsdk.CreateMessageRequest
+	mu         sync.Mutex
+	messages   []wechatsdk.CreateMessageRequest
+	streamErrs []error
 }
 
 func (g *weixinGateway) EnsureChannel(context.Context, wechatsdk.EnsureChannelRequest) (string, error) {
@@ -919,6 +1782,13 @@ func (g *weixinGateway) CreateMessage(_ context.Context, req wechatsdk.CreateMes
 }
 
 func (g *weixinGateway) StreamSession(context.Context, wechatsdk.StreamSessionRequest, func(wechatsdk.StreamEvent) error) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.streamErrs) > 0 {
+		err := g.streamErrs[0]
+		g.streamErrs = g.streamErrs[1:]
+		return err
+	}
 	return nil
 }
 
@@ -950,4 +1820,14 @@ func (s *weixinStore) SaveChannelAccountState(_ context.Context, accountUUID str
 	defer s.mu.Unlock()
 	s.states[accountUUID] = state
 	return nil
+}
+
+func (s *weixinStore) state(accountUUID string) map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]any, len(s.states[accountUUID]))
+	for key, value := range s.states[accountUUID] {
+		out[key] = value
+	}
+	return out
 }
