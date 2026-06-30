@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -76,6 +77,17 @@ func firstString(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func stringValue(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case fmt.Stringer:
+		return v.String()
+	default:
+		return ""
+	}
 }
 
 func runDingTalkConformance(t *testing.T) {
@@ -642,6 +654,7 @@ func runLarkConformance(t *testing.T) {
 
 	conformance.Run(t, conformance.Config{
 		Platform:                 beaklark.Platform,
+		MetadataPlatform:         beaklark.Platform,
 		MetadataProvider:         adapter,
 		CredentialSchemaProvider: adapter,
 		CredentialValidator:      adapter,
@@ -808,6 +821,118 @@ func runLarkConformance(t *testing.T) {
 				ReactionID: "reaction-conformance",
 			},
 		}},
+	})
+
+	t.Run("feishu runtime platform remains beak-facing", func(t *testing.T) {
+		conformance.Run(t, conformance.Config{
+			Platform:            "feishu",
+			MetadataPlatform:    beaklark.Platform,
+			MetadataProvider:    adapter,
+			CredentialValidator: adapter,
+			InboundParser:       adapter,
+			Acknowledger:        adapter,
+			HostStreamer:        adapter,
+			CredentialCases: []conformance.CredentialValidationCase{{
+				Name: "valid feishu credential exposes feishu metadata platform",
+				Request: conformance.CredentialValidationRequest{
+					WorkspaceUUID: "workspace-1",
+					ChannelUUID:   "channel-1",
+					Credential: map[string]any{
+						"app_id":     "cli_feishu_conformance",
+						"app_secret": "secret_feishu_conformance",
+						"brand":      "feishu",
+					},
+				},
+				Expect: conformance.CredentialValidationExpectation{
+					Valid:              true,
+					AccountKey:         "cli_feishu_conformance",
+					DisplayName:        "Beak Conformance Bot",
+					MetadataPlatform:   "feishu",
+					RequireAccountID:   true,
+					RequireBotIdentity: true,
+				},
+			}},
+			HostStreamCases: []conformance.HostStreamCase{{
+				Name: "event frame returns feishu inbound",
+				Request: conformance.HostStreamConnectRequest{
+					Account: conformance.ChannelAccount{
+						UUID:       "account-stream-feishu",
+						Credential: larkCredential("account-stream-feishu"),
+						State:      map[string]any{},
+					},
+				},
+				Expect: conformance.HostStreamConnectExpectation{
+					URLContains:            "wss://lark-stream.test/ws",
+					ReadMessageType:        conformance.StreamMessageTypeBinary,
+					RequireServiceID:       true,
+					RequirePingInterval:    true,
+					RequirePongTimeout:     true,
+					RequireState:           true,
+					RequireConnectedHealth: true,
+				},
+				Frames: []conformance.HostStreamFrameCase{{
+					Name: "event frame creates feishu message",
+					Request: conformance.StreamFrameRequest{
+						MessageType: conformance.StreamMessageTypeBinary,
+						Data:        larkStreamEventFrame(t, "feishu-stream-message-conformance"),
+					},
+					Expect: conformance.HostStreamFrameExpectation{
+						MinResponseFrames:   1,
+						ResponseMessageType: conformance.StreamMessageTypeBinary,
+						RequireEventResult:  true,
+						EventType:           "im.message.receive_v1",
+						RuntimeHealth: conformance.RuntimeHealthExpectation{
+							RequireLastActivityAt: true,
+							RequireLastEventAt:    true,
+						},
+					},
+				}},
+			}},
+			InboundCases: []conformance.InboundCase{{
+				Name: "webhook creates feishu inbound",
+				Fixture: conformance.InboundFixture{
+					WorkspaceUUID: "workspace-1",
+					ChannelUUID:   "channel-1",
+					AccountUUID:   "account-feishu",
+					Credential:    larkCredential("account-feishu"),
+					Raw: json.RawMessage(`{
+						"schema":"2.0",
+						"header":{"event_id":"evt_feishu_conformance","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
+						"event":{
+							"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+							"message":{"message_id":"om_feishu_conformance","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"hello feishu\"}","create_time":"1770000000000"}
+						}
+					}`),
+				},
+				Expect: conformance.InboundExpectation{
+					ChatType:          conformance.ChatTypeGroup,
+					ChatID:            "oc_group",
+					ChatDisplayName:   "Team",
+					ChatAvatarURL:     "https://example.test/team.png",
+					ChatIdentityID:    "oc_group",
+					SenderID:          "ou_user",
+					SenderDisplayName: "Alice",
+					Text:              "hello feishu",
+					RequireMessageID:  true,
+				},
+			}},
+			AckCases: []conformance.AckCase{{
+				Name: "feishu ack keeps runtime platform",
+				Request: conformance.OutboundAck{
+					AccountUUID:     "account-feishu",
+					ChatType:        conformance.ChatTypeGroup,
+					ChatID:          "oc_group",
+					TargetMessageID: "om_conformance",
+					Action:          "start",
+					Emoji:           "thinking",
+				},
+				Expect: conformance.AckExpectation{
+					Status:     "sent",
+					Mode:       "reaction",
+					ReactionID: "reaction-conformance",
+				},
+			}},
+		})
 	})
 
 	t.Run("runtime health start is host-owned and event updates activity", func(t *testing.T) {
@@ -1005,12 +1130,13 @@ func (a larkAdapter) ValidateCredential(ctx context.Context, req conformance.Cre
 
 func (a larkAdapter) ParseInbound(ctx context.Context, fixture conformance.InboundFixture) ([]conformance.InboundMessage, error) {
 	account := larkAccount(fixture)
+	platform := firstString(fixture.Platform, account.Platform, beaklark.Platform)
 	result, err := a.webhook.HandleWebhook(ctx, larksdk.Runtime{
 		WorkspaceUUID: firstString(fixture.WorkspaceUUID, "workspace-1"),
 		Channel: larksdk.Channel{
 			UUID:          firstString(fixture.ChannelUUID, "channel-1"),
 			WorkspaceUUID: firstString(fixture.WorkspaceUUID, "workspace-1"),
-			Platform:      beaklark.Platform,
+			Platform:      platform,
 		},
 		Account:      account,
 		Gateway:      &larkGateway{},
@@ -1027,7 +1153,7 @@ func (a larkAdapter) Acknowledge(ctx context.Context, req conformance.OutboundAc
 	sdkReq := convert[larksdk.OutboundAck](a.t, req)
 	account := larksdk.ChannelAccount{
 		UUID:       firstString(req.AccountUUID, "account-1"),
-		Platform:   beaklark.Platform,
+		Platform:   firstString(req.Platform, beaklark.Platform),
 		Credential: larkCredential(firstString(req.AccountUUID, "account-1")),
 	}
 	result, err := a.connector.Acknowledge(ctx, larksdk.Runtime{
@@ -1093,7 +1219,7 @@ func larkAccount(fixture conformance.InboundFixture) larksdk.ChannelAccount {
 		UUID:          firstString(fixture.AccountUUID, "account-1"),
 		WorkspaceUUID: firstString(fixture.WorkspaceUUID, "workspace-1"),
 		ChannelUUID:   firstString(fixture.ChannelUUID, "channel-1"),
-		Platform:      beaklark.Platform,
+		Platform:      firstString(fixture.Platform, larkPlatformFromCredential(credential), beaklark.Platform),
 		Credential:    credential,
 		State:         fixture.AccountState,
 	}
@@ -1115,7 +1241,7 @@ func larkStreamAccount(req conformance.HostStreamConnectRequest) larksdk.Channel
 		UUID:          firstString(req.Account.UUID, "account-1"),
 		WorkspaceUUID: firstString(req.Account.WorkspaceUUID, req.WorkspaceUUID, "workspace-1"),
 		ChannelUUID:   firstString(req.Account.ChannelUUID, req.ChannelUUID, "channel-1"),
-		Platform:      beaklark.Platform,
+		Platform:      firstString(req.Account.Platform, larkPlatformFromCredential(credential), beaklark.Platform),
 		Credential:    credential,
 		State:         state,
 	}
@@ -1134,13 +1260,36 @@ func larkFrameAccount(req conformance.StreamFrameRequest) larksdk.ChannelAccount
 func larkRuntime(workspaceUUID, channelUUID string, account larksdk.ChannelAccount, httpClient *http.Client) larksdk.Runtime {
 	workspaceUUID = firstString(workspaceUUID, account.WorkspaceUUID, "workspace-1")
 	channelUUID = firstString(channelUUID, account.ChannelUUID, "channel-1")
+	platform := firstString(account.Platform, larkPlatformFromCredential(account.Credential), beaklark.Platform)
 	return larksdk.Runtime{
 		WorkspaceUUID: workspaceUUID,
-		Channel:       larksdk.Channel{UUID: channelUUID, WorkspaceUUID: workspaceUUID, Platform: beaklark.Platform},
+		Channel:       larksdk.Channel{UUID: channelUUID, WorkspaceUUID: workspaceUUID, Platform: platform},
 		Account:       account,
 		Gateway:       &larkGateway{},
 		AccountStore:  newLarkStore(),
 		HTTPClient:    httpClient,
+	}
+}
+
+func larkPlatformFromCredential(credential map[string]any) string {
+	platform := strings.TrimSpace(stringValue(credential["platform"]))
+	if platform != "" {
+		return platform
+	}
+	switch strings.ToLower(strings.TrimSpace(stringValue(credential["brand"]))) {
+	case "feishu":
+		return "feishu"
+	case "lark":
+		return "lark"
+	}
+	baseURL := strings.ToLower(strings.TrimSpace(stringValue(credential["base_url"])))
+	switch {
+	case strings.Contains(baseURL, "open.feishu.cn"):
+		return "feishu"
+	case strings.Contains(baseURL, "open.larksuite.com"):
+		return "lark"
+	default:
+		return ""
 	}
 }
 
