@@ -245,6 +245,54 @@ func runDingTalkConformance(t *testing.T) {
 				MentionedMe:       &trueValue,
 				RequireMessageID:  true,
 			},
+		}, {
+			Name: "reply exposes referenced message",
+			Fixture: conformance.InboundFixture{
+				WorkspaceUUID: "workspace-1",
+				ChannelUUID:   "channel-1",
+				AccountUUID:   "account-1",
+				Credential:    dingtalkCredential("account-1"),
+				Raw: json.RawMessage(`{
+					"conversationType":"2",
+					"conversationId":"cid-group",
+					"conversationTitle":"Team",
+					"senderStaffId":"staff-1",
+					"senderNick":"Alice",
+					"msgId":"msg-reply-conformance",
+					"msgtype":"reply",
+					"isInAtList":false,
+					"content":"current reply",
+					"isReplyMsg":true,
+					"repliedMsg":{
+						"msgId":"quoted-dingtalk-conformance",
+						"msgType":"text",
+						"senderId":"staff-2",
+						"senderNick":"Bob",
+						"content":{"text":"quoted dingtalk"}
+					},
+					"robotCode":"robot-1"
+				}`),
+			},
+			Expect: conformance.InboundExpectation{
+				ChatType:          conformance.ChatTypeGroup,
+				ChatID:            "cid-group",
+				ChatDisplayName:   "Team",
+				ChatIdentityID:    "cid-group",
+				SenderID:          "staff-1",
+				SenderDisplayName: "Alice",
+				Text:              "current reply",
+				ReferencedMessage: &conformance.ReferencedMessageExpectation{
+					Platform:          beakdingtalk.Platform,
+					MessageID:         "quoted-dingtalk-conformance",
+					ChatType:          conformance.ChatTypeGroup,
+					ChatID:            "cid-group",
+					SenderID:          "staff-2",
+					SenderDisplayName: "Bob",
+					MessageType:       "text",
+					Text:              "quoted dingtalk",
+				},
+				RequireMessageID: true,
+			},
 		}},
 		AckCases: []conformance.AckCase{{
 			Name: "processing ack is unsupported without sending a message",
@@ -804,6 +852,46 @@ func runLarkConformance(t *testing.T) {
 				MentionIDs:        []string{"ou_bot"},
 				RequireMessageID:  true,
 			},
+		}, {
+			Name: "reply exposes referenced message",
+			Fixture: conformance.InboundFixture{
+				WorkspaceUUID: "workspace-1",
+				ChannelUUID:   "channel-1",
+				AccountUUID:   "account-1",
+				Credential:    larkCredential("account-1"),
+				Raw: json.RawMessage(`{
+					"schema":"2.0",
+					"header":{"event_id":"evt_reply_conformance","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
+					"event":{
+						"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+						"message":{"message_id":"om_reply_conformance","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"reply text\"}","create_time":"1770000000000","parent_id":"om_parent_conformance","root_id":"om_root_conformance","thread_id":"omt_conformance"}
+					}
+				}`),
+			},
+			Expect: conformance.InboundExpectation{
+				ChatType:          conformance.ChatTypeGroup,
+				ChatID:            "oc_group",
+				ThreadID:          "omt_conformance",
+				ChatDisplayName:   "Team",
+				ChatAvatarURL:     "https://example.test/team.png",
+				ChatIdentityID:    "oc_group",
+				SenderID:          "ou_user",
+				SenderDisplayName: "Alice",
+				Text:              "reply text",
+				ReferencedMessage: &conformance.ReferencedMessageExpectation{
+					Platform:    beaklark.Platform,
+					MessageID:   "om_parent_conformance",
+					ChatType:    conformance.ChatTypeGroup,
+					ChatID:      "oc_group",
+					ThreadID:    "omt_conformance",
+					RootID:      "om_root_conformance",
+					SenderID:    "ou_parent",
+					MessageType: "text",
+					Text:        "quoted lark",
+					CreatedAt:   "1770000001000",
+				},
+				RequireMessageID: true,
+			},
 		}},
 		AckCases: []conformance.AckCase{{
 			Name: "processing ack adds lark reaction",
@@ -914,6 +1002,46 @@ func runLarkConformance(t *testing.T) {
 					SenderDisplayName: "Alice",
 					Text:              "hello feishu",
 					RequireMessageID:  true,
+				},
+			}, {
+				Name: "webhook creates feishu referenced message",
+				Fixture: conformance.InboundFixture{
+					WorkspaceUUID: "workspace-1",
+					ChannelUUID:   "channel-1",
+					AccountUUID:   "account-feishu",
+					Credential:    larkCredential("account-feishu"),
+					Raw: json.RawMessage(`{
+						"schema":"2.0",
+						"header":{"event_id":"evt_feishu_reply_conformance","event_type":"im.message.receive_v1","app_id":"cli_1","token":"verify-token"},
+						"event":{
+							"sender":{"sender_id":{"open_id":"ou_user"},"sender_type":"user"},
+							"message":{"message_id":"om_feishu_reply_conformance","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"hello feishu reply\"}","create_time":"1770000000000","parent_id":"om_feishu_parent_conformance","root_id":"om_feishu_root_conformance","thread_id":"omt_feishu_conformance"}
+						}
+					}`),
+				},
+				Expect: conformance.InboundExpectation{
+					ChatType:          conformance.ChatTypeGroup,
+					ChatID:            "oc_group",
+					ThreadID:          "omt_feishu_conformance",
+					ChatDisplayName:   "Team",
+					ChatAvatarURL:     "https://example.test/team.png",
+					ChatIdentityID:    "oc_group",
+					SenderID:          "ou_user",
+					SenderDisplayName: "Alice",
+					Text:              "hello feishu reply",
+					ReferencedMessage: &conformance.ReferencedMessageExpectation{
+						Platform:    "feishu",
+						MessageID:   "om_feishu_parent_conformance",
+						ChatType:    conformance.ChatTypeGroup,
+						ChatID:      "oc_group",
+						ThreadID:    "omt_feishu_conformance",
+						RootID:      "om_feishu_root_conformance",
+						SenderID:    "ou_parent",
+						MessageType: "text",
+						Text:        "quoted feishu",
+						CreatedAt:   "1770000001000",
+					},
+					RequireMessageID: true,
 				},
 			}},
 			AckCases: []conformance.AckCase{{
@@ -1077,6 +1205,36 @@ func newLarkAdapter(t *testing.T) larkAdapter {
 						"chat_id":    "oc_group",
 						"name":       "Team",
 						"avatar_url": "https://example.test/team.png",
+					},
+				})
+			case "/open-apis/im/v1/messages/om_parent_conformance", "/open-apis/im/v1/messages/om_feishu_parent_conformance":
+				if got := req.URL.Query().Get("card_msg_content_type"); got != "raw_card_content" {
+					t.Fatalf("lark card_msg_content_type = %q, want raw_card_content", got)
+				}
+				messageID := strings.TrimPrefix(req.URL.Path, "/open-apis/im/v1/messages/")
+				rootID := "om_root_conformance"
+				threadID := "omt_conformance"
+				text := "quoted lark"
+				if strings.Contains(messageID, "feishu") {
+					rootID = "om_feishu_root_conformance"
+					threadID = "omt_feishu_conformance"
+					text = "quoted feishu"
+				}
+				return jsonResponse(map[string]any{
+					"code": 0,
+					"msg":  "ok",
+					"data": map[string]any{
+						"items": []map[string]any{{
+							"message_id":  messageID,
+							"root_id":     rootID,
+							"thread_id":   threadID,
+							"chat_id":     "oc_group",
+							"chat_type":   "group",
+							"msg_type":    "text",
+							"content":     `{"text":"` + text + `"}`,
+							"create_time": "1770000001000",
+							"sender":      map[string]any{"sender_id": map[string]any{"open_id": "ou_parent"}, "sender_type": "user"},
+						}},
 					},
 				})
 			case "/open-apis/im/v1/messages/om_conformance/reactions":
@@ -1550,6 +1708,46 @@ func runWeixinConformance(t *testing.T) {
 				MentionIDs:       []string{"ilink-bot-conformance"},
 				RequireMessageID: true,
 				RequireDedupeKey: true,
+			},
+		}, {
+			Name: "ref_msg exposes referenced message",
+			Fixture: conformance.InboundFixture{
+				WorkspaceUUID: "workspace-1",
+				ChannelUUID:   "channel-1",
+				AccountUUID:   "account-1",
+				Raw: json.RawMessage(`{
+					"ret":0,
+					"get_updates_buf":"buf-conformance-ref",
+					"msgs":[{
+						"message_id":303,
+						"from_user_id":"user-1",
+						"to_user_id":"bot-1",
+						"group_id":"group-1",
+						"message_type":1,
+						"message_state":2,
+						"item_list":[
+							{"type":1,"text_item":{"text":"reply text"}},
+							{"type":1,"ref_msg":{"title":"引用标题","message_id":99,"message_item":{"type":1,"text_item":{"text":"quoted weixin"}}}}
+						]
+					}]
+				}`),
+			},
+			Expect: conformance.InboundExpectation{
+				ChatType:         conformance.ChatTypeGroup,
+				ChatID:           "group-1",
+				ChatIdentityID:   "group-1",
+				SenderID:         "user-1",
+				Text:             "reply text",
+				RequireMessageID: true,
+				RequireDedupeKey: true,
+				ReferencedMessage: &conformance.ReferencedMessageExpectation{
+					Platform:    beakweixin.Platform,
+					MessageID:   "99",
+					ChatType:    conformance.ChatTypeGroup,
+					ChatID:      "group-1",
+					MessageType: "text",
+					Text:        "引用标题 | quoted weixin",
+				},
 			},
 		}},
 		AckCases: []conformance.AckCase{{
