@@ -1,11 +1,12 @@
 module gitlab.jiagouyun.com/guance/beak-agent-channel-sdk/beak-channel-sdk-conformance-tests
 
-go 1.22
+go 1.23
 
 require (
 	github.com/GuanceCloud/beak-agent-channel-dingtalk v0.0.0
 	github.com/GuanceCloud/beak-agent-channel-lark v0.0.0
 	github.com/GuanceCloud/beak-agent-channel-wechat v0.0.0
+	github.com/TrueWatchTech/truewatch-beak-agent-channel-teams v0.0.0
 	github.com/larksuite/oapi-sdk-go/v3 v3.5.3
 	github.com/open-dingtalk/dingtalk-stream-sdk-go v0.9.1
 	gitlab.jiagouyun.com/guance/beak-agent-channel-sdk/beak-channel-sdk-conformance v0.0.0
@@ -22,5 +23,7 @@ replace github.com/GuanceCloud/beak-agent-channel-dingtalk => ../beak-agent-ding
 replace github.com/GuanceCloud/beak-agent-channel-lark => ../beak-agent-lark
 
 replace github.com/GuanceCloud/beak-agent-channel-wechat => ../beak-agent-weixin
+
+replace github.com/TrueWatchTech/truewatch-beak-agent-channel-teams => ../truewatch-beak-agent-channel-teams
 
 replace gitlab.jiagouyun.com/guance/beak-agent-channel-sdk/beak-channel-sdk-conformance => ../beak-channel-sdk-conformance

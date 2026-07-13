@@ -37,6 +37,9 @@ func TestBeakSDKConformance(t *testing.T) {
 	t.Run("weixin", func(t *testing.T) {
 		runWeixinConformance(t)
 	})
+	t.Run("teams", func(t *testing.T) {
+		runTeamsConformance(t)
+	})
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
