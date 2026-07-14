@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -101,6 +103,37 @@ func runTeamsConformance(t *testing.T) {
 			Expect: conformance.AckExpectation{Status: "unsupported", Mode: "reaction"},
 		}},
 	})
+}
+
+func TestTeamsWebhookErrorContract(t *testing.T) {
+	connector := beakteams.Connector{}
+	account := teamssdk.ChannelAccount{
+		UUID:       "acct-1",
+		Platform:   beakteams.Platform,
+		Credential: map[string]any{"client_id": "app-id", "client_secret": "secret"},
+	}
+	tests := []struct {
+		name       string
+		body       string
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "malformed payload", body: `{`, wantStatus: http.StatusBadRequest, wantCode: "invalid_request_body"},
+		{
+			name:       "authentication failure",
+			body:       `{"type":"message","id":"activity-1","serviceUrl":"https://smba.trafficmanager.net/amer/","channelId":"msteams","conversation":{"id":"C1"},"from":{"id":"29:user"},"recipient":{"id":"28:app-id"}}`,
+			wantStatus: http.StatusForbidden,
+			wantCode:   "channel_webhook_auth_failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(tt.body))
+			_, err := connector.HandleWebhookRequest(context.Background(), teamssdk.Runtime{}, account, req)
+			conformance.AssertWebhookError(t, err, tt.wantStatus, tt.wantCode)
+		})
+	}
 }
 
 func teamsFixture(raw string) conformance.InboundFixture {
