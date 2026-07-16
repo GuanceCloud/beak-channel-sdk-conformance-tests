@@ -21,6 +21,7 @@ import (
 	larksdk "github.com/GuanceCloud/beak-agent-channel-lark/sdk"
 	beakweixin "github.com/GuanceCloud/beak-agent-channel-wechat"
 	wechatsdk "github.com/GuanceCloud/beak-agent-channel-wechat/sdk"
+	slackconformance "github.com/TrueWatchTech/truewatch-beak-agent-channel-slack/conformance"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 	dtpayload "github.com/open-dingtalk/dingtalk-stream-sdk-go/payload"
 	dtutils "github.com/open-dingtalk/dingtalk-stream-sdk-go/utils"
@@ -37,8 +38,14 @@ func TestBeakSDKConformance(t *testing.T) {
 	t.Run("weixin", func(t *testing.T) {
 		runWeixinConformance(t)
 	})
+	t.Run("slack", func(t *testing.T) {
+		slackconformance.Run(t)
+	})
 	t.Run("teams", func(t *testing.T) {
 		runTeamsConformance(t)
+	})
+	t.Run("telegram", func(t *testing.T) {
+		runTelegramConformance(t)
 	})
 }
 
