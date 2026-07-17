@@ -29,11 +29,11 @@ func runTelegramConformance(t *testing.T) {
 			Name: "valid bot token",
 			Request: conformance.CredentialValidationRequest{
 				WorkspaceUUID: "ws-1", ChannelUUID: "channel-1", Platform: beaktelegram.Platform,
-				Credential: map[string]any{"bot_token": "123456:ABCdef-test-token", "webhook_secret": "test-webhook-secret"},
+				Credential: map[string]any{"bot_token": "123456:ABCdef-test-token"},
 			},
 			Expect: conformance.CredentialValidationExpectation{
 				Valid: true, AccountKey: "123456", DisplayName: "@testbot", MetadataPlatform: beaktelegram.Platform,
-				RequireAccountID: true, RequireBotIdentity: true,
+				RequireAccountID: true, RequireBotIdentity: true, RequiredCredentialKeys: []string{"webhook_secret"},
 			},
 		}},
 		InboundCases: []conformance.InboundCase{
@@ -208,6 +208,46 @@ func TestTelegramTransientCredentialFailureRemainsAHostError(t *testing.T) {
 	conformance.AssertCredentialValidationResult(t, req, result, err, conformance.CredentialValidationExpectation{RequireGoError: true})
 }
 
+func TestTelegramStartRegistersHostWebhook(t *testing.T) {
+	var payload map[string]any
+	httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(req.URL.Path, "/setWebhook") {
+			t.Fatalf("request path = %q, want setWebhook", req.URL.Path)
+		}
+		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode setWebhook payload: %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"result":true}`)),
+		}, nil
+	})}
+	account := telegramsdk.ChannelAccount{
+		UUID: "acct-1", WorkspaceUUID: "ws-1", ChannelUUID: "channel-1", Platform: beaktelegram.Platform,
+		Credential: map[string]any{
+			"account_id": "123456", "bot_id": "123456", "bot_token": "123456:ABCdef-test-token",
+			"webhook_secret": "generated-secret",
+		},
+	}
+	webhookURL := "https://beak.example.com/api/v1/channel-webhooks/telegram/acct-1"
+	err := (beaktelegram.Connector{}).Start(context.Background(), telegramsdk.Runtime{
+		WorkspaceUUID: "ws-1",
+		Channel: telegramsdk.Channel{
+			UUID: "channel-1", WorkspaceUUID: "ws-1", Platform: beaktelegram.Platform,
+		},
+		Account: account, Accounts: []telegramsdk.ChannelAccount{account},
+		Webhook: &telegramsdk.WebhookEndpoint{URL: webhookURL},
+		Gateway: &telegramConformanceGateway{}, AccountStore: newTelegramConformanceStore(), HTTPClient: httpClient,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if payload["url"] != webhookURL || payload["secret_token"] != "generated-secret" {
+		t.Fatalf("setWebhook payload = %#v", payload)
+	}
+}
+
 func telegramFixture(raw string) conformance.InboundFixture {
 	return conformance.InboundFixture{
 		WorkspaceUUID: "ws-1", ChannelUUID: "channel-1", AccountUUID: "acct-1", Platform: beaktelegram.Platform,
@@ -232,8 +272,9 @@ func (a *telegramConformanceAdapter) Metadata() conformance.ConnectorMetadata {
 		Capabilities: conformance.Capabilities{
 			LoginModes: m.Capabilities.LoginModes, Text: m.Capabilities.Text, Media: m.Capabilities.Media,
 			GroupChat: m.Capabilities.GroupChat, DirectChat: m.Capabilities.DirectChat, Stream: m.Capabilities.Stream,
-			Webhook: m.Capabilities.Webhook, BlockStreaming: m.Capabilities.BlockStreaming,
-			AckModes: m.Capabilities.AckModes, RuntimeOwnership: m.Capabilities.RuntimeOwnership,
+			Webhook: m.Capabilities.Webhook, WebhookRegistration: m.Capabilities.WebhookRegistration,
+			BlockStreaming: m.Capabilities.BlockStreaming, AckModes: m.Capabilities.AckModes,
+			RuntimeOwnership: m.Capabilities.RuntimeOwnership,
 		},
 	}
 }

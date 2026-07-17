@@ -156,8 +156,9 @@ func (a *teamsConformanceAdapter) Metadata() conformance.ConnectorMetadata {
 		Capabilities: conformance.Capabilities{
 			LoginModes: m.Capabilities.LoginModes, Text: m.Capabilities.Text, Media: m.Capabilities.Media,
 			GroupChat: m.Capabilities.GroupChat, DirectChat: m.Capabilities.DirectChat, Stream: m.Capabilities.Stream,
-			Webhook: m.Capabilities.Webhook, BlockStreaming: m.Capabilities.BlockStreaming,
-			AckModes: m.Capabilities.AckModes, RuntimeOwnership: m.Capabilities.RuntimeOwnership,
+			Webhook: m.Capabilities.Webhook, WebhookRegistration: m.Capabilities.WebhookRegistration,
+			BlockStreaming: m.Capabilities.BlockStreaming, AckModes: m.Capabilities.AckModes,
+			RuntimeOwnership: m.Capabilities.RuntimeOwnership,
 		},
 	}
 }
