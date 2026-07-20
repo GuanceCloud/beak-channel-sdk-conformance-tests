@@ -24,6 +24,7 @@ func TestSDKTypesStayInSync(t *testing.T) {
 		"truewatch-beak-agent-channel-slack/sdk/types.go",
 		"truewatch-beak-agent-channel-teams/sdk/types.go",
 		"truewatch-beak-agent-channel-telegram/sdk/types.go",
+		"beak-agent-wecom/sdk/types.go",
 	}
 
 	canonicalPath := filepath.Join(root, paths[0])

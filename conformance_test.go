@@ -47,6 +47,9 @@ func TestBeakSDKConformance(t *testing.T) {
 	t.Run("telegram", func(t *testing.T) {
 		runTelegramConformance(t)
 	})
+	t.Run("wecom", func(t *testing.T) {
+		runWeComConformance(t)
+	})
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -494,16 +497,21 @@ func (a dingtalkAdapter) ConnectStream(ctx context.Context, req conformance.Host
 	if result == nil {
 		return nil, err
 	}
-	return &conformance.StreamConnectResult{
+	out := &conformance.StreamConnectResult{
 		URL:             result.URL,
 		Headers:         result.Headers,
 		ServiceID:       result.ServiceID,
 		ReadMessageType: result.ReadMessageType,
+		WaitForReady:    result.WaitForReady,
 		PingInterval:    result.PingInterval,
 		PongTimeout:     result.PongTimeout,
 		State:           result.State,
 		HealthUpdates:   result.HealthUpdates,
-	}, err
+	}
+	for _, frame := range result.InitialFrames {
+		out.InitialFrames = append(out.InitialFrames, conformance.StreamFrame{MessageType: frame.MessageType, Data: frame.Data})
+	}
+	return out, err
 }
 
 func (a dingtalkAdapter) BuildStreamPing(ctx context.Context, req conformance.StreamPingRequest) (*conformance.StreamFrame, error) {
@@ -597,6 +605,9 @@ func dingtalkStreamFrameResult(t *testing.T, result *dingtalksdk.StreamFrameResu
 		HealthUpdates: result.HealthUpdates,
 		CloseReason:   result.CloseReason,
 		State:         result.State,
+		ResponseTo:    result.ResponseTo,
+		Ready:         result.Ready,
+		Terminal:      result.Terminal,
 	}
 	for _, frame := range result.ResponseFrames {
 		out.ResponseFrames = append(out.ResponseFrames, conformance.StreamFrame{
@@ -1341,16 +1352,21 @@ func (a larkAdapter) ConnectStream(ctx context.Context, req conformance.HostStre
 	if result == nil {
 		return nil, err
 	}
-	return &conformance.StreamConnectResult{
+	out := &conformance.StreamConnectResult{
 		URL:             result.URL,
 		Headers:         result.Headers,
 		ServiceID:       result.ServiceID,
 		ReadMessageType: result.ReadMessageType,
+		WaitForReady:    result.WaitForReady,
 		PingInterval:    result.PingInterval,
 		PongTimeout:     result.PongTimeout,
 		State:           result.State,
 		HealthUpdates:   result.HealthUpdates,
-	}, err
+	}
+	for _, frame := range result.InitialFrames {
+		out.InitialFrames = append(out.InitialFrames, conformance.StreamFrame{MessageType: frame.MessageType, Data: frame.Data})
+	}
+	return out, err
 }
 
 func (a larkAdapter) BuildStreamPing(ctx context.Context, req conformance.StreamPingRequest) (*conformance.StreamFrame, error) {
@@ -1467,6 +1483,9 @@ func larkStreamFrameResult(t *testing.T, result *larksdk.StreamFrameResult) *con
 		HealthUpdates: result.HealthUpdates,
 		CloseReason:   result.CloseReason,
 		State:         result.State,
+		ResponseTo:    result.ResponseTo,
+		Ready:         result.Ready,
+		Terminal:      result.Terminal,
 	}
 	for _, frame := range result.ResponseFrames {
 		out.ResponseFrames = append(out.ResponseFrames, conformance.StreamFrame{
