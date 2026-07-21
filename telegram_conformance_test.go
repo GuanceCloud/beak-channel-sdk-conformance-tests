@@ -25,6 +25,7 @@ func runTelegramConformance(t *testing.T) {
 		CredentialValidator:      adapter,
 		InboundParser:            adapter,
 		Acknowledger:             adapter,
+		Sender:                   adapter,
 		CredentialCases: []conformance.CredentialValidationCase{{
 			Name: "valid bot token",
 			Request: conformance.CredentialValidationRequest{
@@ -152,6 +153,14 @@ func runTelegramConformance(t *testing.T) {
 				TargetMessageID: "201", Mode: "reaction", Action: "start", Intent: "processing",
 			},
 			Expect: conformance.AckExpectation{Status: "sent", Mode: "reaction", ReactionID: "👀"},
+		}},
+		SendCases: []conformance.SendCase{{
+			Name: "markdown outbound exposes common send result",
+			Request: conformance.OutboundMessage{
+				AccountUUID: "123456", ChatType: "group", ChatID: "-200", ThreadID: "77",
+				MessageUUID: "message-send-telegram", Text: "**Telegram outbound**", Format: "markdown",
+			},
+			Expect: conformance.SendExpectation{MessageID: "301", RequiredRawKeys: []string{"message_ids"}},
 		}},
 	})
 }
@@ -363,6 +372,31 @@ func (a *telegramConformanceAdapter) Acknowledge(ctx context.Context, req confor
 	}, nil
 }
 
+func (a *telegramConformanceAdapter) Send(ctx context.Context, req conformance.OutboundMessage) (*conformance.SendResult, error) {
+	account := telegramsdk.ChannelAccount{
+		UUID: req.AccountUUID, Platform: beaktelegram.Platform,
+		Credential: map[string]any{
+			"account_id": req.AccountUUID, "bot_id": req.AccountUUID, "bot_token": "123456:ABCdef-test-token",
+		},
+	}
+	result, err := a.conn.Send(ctx, telegramsdk.Runtime{
+		Account: account, Accounts: []telegramsdk.ChannelAccount{account},
+		AccountStore: newTelegramConformanceStore(), HTTPClient: telegramConformanceHTTPClient(),
+	}, telegramsdk.OutboundMessage{
+		WorkspaceUUID: req.WorkspaceUUID, Platform: req.Platform, AccountUUID: req.AccountUUID,
+		ChannelUUID: req.ChannelUUID, SessionUUID: req.SessionUUID, MessageUUID: req.MessageUUID,
+		ChatType: req.ChatType, ChatID: req.ChatID, ThreadID: req.ThreadID, Text: req.Text,
+		Format: req.Format, Title: req.Title, MentionAll: req.MentionAll, Raw: req.Raw,
+		Mentions: telegramSDKMentions(req.Mentions),
+	})
+	if result == nil {
+		return nil, err
+	}
+	return &conformance.SendResult{
+		Platform: result.Platform, AccountUUID: result.AccountUUID, MessageID: result.MessageID, Raw: result.Raw,
+	}, err
+}
+
 func telegramConformanceReference(ref *telegramsdk.ReferencedMessage) *conformance.ReferencedMessage {
 	if ref == nil {
 		return nil
@@ -385,11 +419,24 @@ func telegramConformanceMentions(mentions []telegramsdk.MentionIdentity) []confo
 	return out
 }
 
+func telegramSDKMentions(mentions []conformance.MentionIdentity) []telegramsdk.MentionIdentity {
+	if len(mentions) == 0 {
+		return nil
+	}
+	out := make([]telegramsdk.MentionIdentity, len(mentions))
+	for i, mention := range mentions {
+		out[i] = telegramsdk.MentionIdentity{ID: mention.ID, IDType: mention.IDType, DisplayName: mention.DisplayName}
+	}
+	return out
+}
+
 func telegramConformanceHTTPClient() *http.Client {
 	return &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		body := `{"ok":true,"result":{"id":123456,"is_bot":true,"first_name":"Test Bot","username":"testbot"}}`
 		if strings.HasSuffix(req.URL.Path, "/setMessageReaction") {
 			body = `{"ok":true,"result":true}`
+		} else if strings.HasSuffix(req.URL.Path, "/sendMessage") {
+			body = `{"ok":true,"result":{"message_id":301,"date":1720000000,"chat":{"id":-200,"type":"supergroup"},"text":"Telegram outbound"}}`
 		}
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
 	})}

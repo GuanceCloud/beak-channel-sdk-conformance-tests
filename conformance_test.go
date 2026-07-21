@@ -115,6 +115,7 @@ func runDingTalkConformance(t *testing.T) {
 		CredentialValidator:      adapter,
 		InboundParser:            adapter,
 		Acknowledger:             adapter,
+		Sender:                   adapter,
 		HostStreamer:             adapter,
 		HostStreamCases: []conformance.HostStreamCase{{
 			Name: "connect, ping, and system frames",
@@ -321,6 +322,22 @@ func runDingTalkConformance(t *testing.T) {
 				Mode:   "unsupported",
 			},
 		}},
+		SendCases: []conformance.SendCase{{
+			Name: "markdown outbound exposes common send result",
+			Request: conformance.OutboundMessage{
+				AccountUUID: "account-1",
+				MessageUUID: "message-send-dingtalk",
+				ChatType:    conformance.ChatTypeGroup,
+				ChatID:      "cid-group",
+				Text:        "# Conformance\nDingTalk outbound",
+				Format:      "markdown",
+				Raw:         map[string]any{"force_openapi": true},
+			},
+			Expect: conformance.SendExpectation{
+				MessageID:       "pqk-conformance",
+				RequiredRawKeys: []string{"delivery_method", "msg_type"},
+			},
+		}},
 	})
 
 	t.Run("runtime health start is host-owned and event updates activity", func(t *testing.T) {
@@ -427,6 +444,8 @@ func newDingTalkAdapter(t *testing.T) dingtalkAdapter {
 					"endpoint": "wss://dingtalk-stream.test/connect",
 					"ticket":   "ticket-conformance",
 				})
+			case "/v1.0/robot/groupMessages/send":
+				return jsonResponse(map[string]any{"processQueryKey": "pqk-conformance"})
 			default:
 				t.Fatalf("unexpected dingtalk request: %s %s", req.Method, req.URL.Path)
 				return nil, nil
@@ -488,6 +507,26 @@ func (a dingtalkAdapter) Acknowledge(ctx context.Context, req conformance.Outbou
 		return nil, err
 	}
 	out := convert[conformance.AckResult](a.t, result)
+	return &out, err
+}
+
+func (a dingtalkAdapter) Send(ctx context.Context, req conformance.OutboundMessage) (*conformance.SendResult, error) {
+	account := dingtalksdk.ChannelAccount{
+		UUID:       firstString(req.AccountUUID, "account-1"),
+		Platform:   beakdingtalk.Platform,
+		Credential: dingtalkCredential(firstString(req.AccountUUID, "account-1")),
+		State:      map[string]any{},
+	}
+	result, err := a.connector.Send(ctx, dingtalksdk.Runtime{
+		Account:      account,
+		Accounts:     []dingtalksdk.ChannelAccount{account},
+		AccountStore: newDingTalkStore(),
+		HTTPClient:   a.httpClient,
+	}, convert[dingtalksdk.OutboundMessage](a.t, req))
+	if result == nil {
+		return nil, err
+	}
+	out := convert[conformance.SendResult](a.t, result)
 	return &out, err
 }
 
@@ -729,6 +768,7 @@ func runLarkConformance(t *testing.T) {
 		CredentialValidator:      adapter,
 		InboundParser:            adapter,
 		Acknowledger:             adapter,
+		Sender:                   adapter,
 		HostStreamer:             adapter,
 		HostStreamCases: []conformance.HostStreamCase{{
 			Name: "connect, ping, control pong, and event frame",
@@ -930,6 +970,36 @@ func runLarkConformance(t *testing.T) {
 				ReactionID: "reaction-conformance",
 			},
 		}},
+		SendCases: []conformance.SendCase{{
+			Name: "markdown outbound exposes common send result",
+			Request: conformance.OutboundMessage{
+				AccountUUID: "account-1",
+				MessageUUID: "message-send-lark",
+				ChatType:    conformance.ChatTypeGroup,
+				ChatID:      "oc_group",
+				Text:        "**Lark outbound**",
+				Format:      "markdown",
+			},
+			Expect: conformance.SendExpectation{
+				MessageID:       "om_send_conformance",
+				RequiredRawKeys: []string{"chat_id", "msg_type"},
+			},
+		}, {
+			Name: "common thread id preserves lark reply position",
+			Request: conformance.OutboundMessage{
+				AccountUUID: "account-1",
+				MessageUUID: "message-thread-lark",
+				ChatType:    conformance.ChatTypeGroup,
+				ChatID:      "oc_group",
+				ThreadID:    "omt_conformance",
+				Text:        "Lark thread reply",
+				Format:      "text",
+			},
+			Expect: conformance.SendExpectation{
+				MessageID:       "om_thread_reply_conformance",
+				RequiredRawKeys: []string{"chat_id", "msg_type", "thread_id", "reply_to_message_id"},
+			},
+		}},
 	})
 
 	t.Run("feishu runtime platform remains beak-facing", func(t *testing.T) {
@@ -940,6 +1010,7 @@ func runLarkConformance(t *testing.T) {
 			CredentialValidator: adapter,
 			InboundParser:       adapter,
 			Acknowledger:        adapter,
+			Sender:              adapter,
 			HostStreamer:        adapter,
 			CredentialCases: []conformance.CredentialValidationCase{{
 				Name: "valid feishu credential exposes feishu metadata platform",
@@ -1079,6 +1150,36 @@ func runLarkConformance(t *testing.T) {
 					Status:     "sent",
 					Mode:       "reaction",
 					ReactionID: "reaction-conformance",
+				},
+			}},
+			SendCases: []conformance.SendCase{{
+				Name: "feishu outbound keeps runtime platform",
+				Request: conformance.OutboundMessage{
+					AccountUUID: "account-feishu",
+					MessageUUID: "message-send-feishu",
+					ChatType:    conformance.ChatTypeGroup,
+					ChatID:      "oc_group",
+					Text:        "Feishu outbound",
+					Format:      "text",
+				},
+				Expect: conformance.SendExpectation{
+					MessageID:       "om_send_conformance",
+					RequiredRawKeys: []string{"chat_id", "msg_type"},
+				},
+			}, {
+				Name: "common thread id preserves feishu reply position",
+				Request: conformance.OutboundMessage{
+					AccountUUID: "account-feishu",
+					MessageUUID: "message-thread-feishu",
+					ChatType:    conformance.ChatTypeGroup,
+					ChatID:      "oc_group",
+					ThreadID:    "omt_feishu_conformance",
+					Text:        "Feishu thread reply",
+					Format:      "text",
+				},
+				Expect: conformance.SendExpectation{
+					MessageID:       "om_feishu_thread_reply_conformance",
+					RequiredRawKeys: []string{"chat_id", "msg_type", "thread_id", "reply_to_message_id"},
 				},
 			}},
 		})
@@ -1280,6 +1381,61 @@ func newLarkAdapter(t *testing.T) larkAdapter {
 						"action_time": "1770000000000",
 					},
 				})
+			case "/open-apis/im/v1/messages":
+				if req.Method == http.MethodGet {
+					query := req.URL.Query()
+					threadID := query.Get("container_id")
+					if query.Get("container_id_type") != "thread" || query.Get("sort_type") != "ByCreateTimeDesc" || query.Get("page_size") != "1" {
+						t.Fatalf("lark thread query=%s", req.URL.RawQuery)
+					}
+					messageID := "om_thread_target_conformance"
+					if threadID == "omt_feishu_conformance" {
+						messageID = "om_feishu_thread_target_conformance"
+					} else if threadID != "omt_conformance" {
+						t.Fatalf("unexpected lark thread id=%q", threadID)
+					}
+					return jsonResponse(map[string]any{
+						"code": 0,
+						"msg":  "ok",
+						"data": map[string]any{"items": []map[string]any{{"message_id": messageID, "thread_id": threadID}}},
+					})
+				}
+				var body struct {
+					ReceiveID string `json:"receive_id"`
+					MsgType   string `json:"msg_type"`
+					Content   string `json:"content"`
+				}
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if body.ReceiveID != "oc_group" || body.MsgType == "" || body.Content == "" {
+					t.Fatalf("lark send body=%+v", body)
+				}
+				return jsonResponse(map[string]any{
+					"code": 0,
+					"msg":  "ok",
+					"data": map[string]any{
+						"message_id": "om_send_conformance",
+						"chat_id":    "oc_group",
+					},
+				})
+			case "/open-apis/im/v1/messages/om_thread_target_conformance/reply", "/open-apis/im/v1/messages/om_feishu_thread_target_conformance/reply":
+				var body struct {
+					MsgType       string `json:"msg_type"`
+					Content       string `json:"content"`
+					ReplyInThread bool   `json:"reply_in_thread"`
+				}
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if body.MsgType != "text" || body.Content == "" || !body.ReplyInThread {
+					t.Fatalf("lark thread reply body=%+v", body)
+				}
+				messageID := "om_thread_reply_conformance"
+				if strings.Contains(req.URL.Path, "feishu") {
+					messageID = "om_feishu_thread_reply_conformance"
+				}
+				return jsonResponse(map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"message_id": messageID, "chat_id": "oc_group"}})
 			default:
 				t.Fatalf("unexpected lark request: %s %s", req.Method, req.URL.Path)
 				return nil, nil
@@ -1343,6 +1499,28 @@ func (a larkAdapter) Acknowledge(ctx context.Context, req conformance.OutboundAc
 		return nil, err
 	}
 	out := convert[conformance.AckResult](a.t, result)
+	return &out, err
+}
+
+func (a larkAdapter) Send(ctx context.Context, req conformance.OutboundMessage) (*conformance.SendResult, error) {
+	platform := firstString(req.Platform, beaklark.Platform)
+	account := larksdk.ChannelAccount{
+		UUID:       firstString(req.AccountUUID, "account-1"),
+		Platform:   platform,
+		Credential: larkCredential(firstString(req.AccountUUID, "account-1")),
+		State:      map[string]any{},
+	}
+	result, err := a.connector.Send(ctx, larksdk.Runtime{
+		Channel:      larksdk.Channel{Platform: platform},
+		Account:      account,
+		Accounts:     []larksdk.ChannelAccount{account},
+		AccountStore: newLarkStore(),
+		HTTPClient:   a.httpClient,
+	}, convert[larksdk.OutboundMessage](a.t, req))
+	if result == nil {
+		return nil, err
+	}
+	out := convert[conformance.SendResult](a.t, result)
 	return &out, err
 }
 
@@ -1639,6 +1817,8 @@ func runWeixinConformance(t *testing.T) {
 		LoginPoller:              adapter,
 		InboundParser:            adapter,
 		Acknowledger:             adapter,
+		Sender:                   adapter,
+		SDKOwnedRuntimeCases:     weixinSDKOwnedRuntimeCases(t, adapter),
 		CredentialCases: []conformance.CredentialValidationCase{{
 			Name: "valid credential exposes stable account identity",
 			Request: conformance.CredentialValidationRequest{
@@ -1792,135 +1972,141 @@ func runWeixinConformance(t *testing.T) {
 				Mode:   "typing",
 			},
 		}},
+		SendCases: []conformance.SendCase{{
+			Name: "text outbound exposes common send result",
+			Request: conformance.OutboundMessage{
+				AccountUUID: "account-1",
+				MessageUUID: "message-send-weixin",
+				ChatType:    conformance.ChatTypeDirect,
+				ChatID:      "user-conformance",
+				Text:        "Weixin outbound",
+				Format:      "text",
+			},
+		}},
 	})
+}
 
-	t.Run("runtime health records poll errors and recovered activity", func(t *testing.T) {
-		var getUpdatesCalls int
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/ilink/bot/msg/notifystart", "/ilink/bot/msg/notifystop":
-				_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0})
-			case "/ilink/bot/getupdates":
-				getUpdatesCalls++
-				if getUpdatesCalls == 1 {
-					_ = json.NewEncoder(w).Encode(map[string]any{"ret": 1, "errmsg": "temporary getupdates failure"})
-					return
-				}
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"ret":             0,
-					"get_updates_buf": "buf-health",
-					"msgs": []map[string]any{{
-						"message_id":    401,
-						"from_user_id":  "user-1",
-						"to_user_id":    "bot-1",
-						"message_type":  1,
-						"message_state": 2,
-						"context_token": "ctx-health",
-						"item_list": []map[string]any{{
-							"type":      1,
-							"text_item": map[string]any{"text": "hello health"},
+func weixinSDKOwnedRuntimeCases(t *testing.T, adapter weixinAdapter) []conformance.SDKOwnedRuntimeCase {
+	t.Helper()
+	return []conformance.SDKOwnedRuntimeCase{{
+		Name:     "poll error recovers and records activity",
+		Scenario: conformance.SDKOwnedRuntimeScenarioPollRecovery,
+		Run: func(parent context.Context) (map[string]any, error) {
+			var getUpdatesCalls int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/ilink/bot/msg/notifystart", "/ilink/bot/msg/notifystop":
+					_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0})
+				case "/ilink/bot/getupdates":
+					getUpdatesCalls++
+					if getUpdatesCalls == 1 {
+						_ = json.NewEncoder(w).Encode(map[string]any{"ret": 1, "errmsg": "temporary getupdates failure"})
+						return
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"ret":             0,
+						"get_updates_buf": "buf-health",
+						"msgs": []map[string]any{{
+							"message_id":    401,
+							"from_user_id":  "user-1",
+							"to_user_id":    "bot-1",
+							"message_type":  1,
+							"message_state": 2,
+							"context_token": "ctx-health",
+							"item_list": []map[string]any{{
+								"type":      1,
+								"text_item": map[string]any{"text": "hello health"},
+							}},
 						}},
-					}},
-				})
-			case "/ilink/bot/getconfig":
-				_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0, "typing_ticket": "typing-ticket-conformance"})
-			case "/ilink/bot/sendtyping":
-				_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0})
-			default:
-				t.Fatalf("unexpected weixin request: %s %s", r.Method, r.URL.Path)
+					})
+				case "/ilink/bot/getconfig":
+					_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0, "typing_ticket": "typing-ticket-conformance"})
+				case "/ilink/bot/sendtyping":
+					_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0})
+				default:
+					t.Fatalf("unexpected weixin request: %s %s", r.Method, r.URL.Path)
+				}
+			}))
+			defer server.Close()
+
+			store := newWeixinStore()
+			gateway := &weixinGateway{
+				streamErrs:  []error{errors.New("temporary stream failure")},
+				streamBlock: make(chan struct{}),
 			}
-		}))
-		defer server.Close()
-
-		store := newWeixinStore()
-		gateway := &weixinGateway{
-			streamErrs:  []error{errors.New("temporary stream failure")},
-			streamBlock: make(chan struct{}),
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
-		defer cancel()
-		err := adapter.connector.Start(ctx, wechatsdk.Runtime{
-			WorkspaceUUID: "workspace-1",
-			Channel:       wechatsdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: beakweixin.Platform},
-			Account: wechatsdk.ChannelAccount{
-				UUID:          "account-health",
+			ctx, cancel := context.WithTimeout(parent, 40*time.Millisecond)
+			defer cancel()
+			err := adapter.connector.Start(ctx, wechatsdk.Runtime{
 				WorkspaceUUID: "workspace-1",
-				ChannelUUID:   "channel-1",
-				Platform:      beakweixin.Platform,
-				Credential: map[string]any{
-					"account_id":    "account-health",
-					"bot_token":     "token-conformance",
-					"base_url":      server.URL,
-					"ilink_user_id": "ilink-user-conformance",
-					"ilink_bot_id":  "ilink-bot-conformance",
+				Channel:       wechatsdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: beakweixin.Platform},
+				Account: wechatsdk.ChannelAccount{
+					UUID:          "account-health",
+					WorkspaceUUID: "workspace-1",
+					ChannelUUID:   "channel-1",
+					Platform:      beakweixin.Platform,
+					Credential: map[string]any{
+						"account_id":    "account-health",
+						"bot_token":     "token-conformance",
+						"base_url":      server.URL,
+						"ilink_user_id": "ilink-user-conformance",
+						"ilink_bot_id":  "ilink-bot-conformance",
+					},
+					State: map[string]any{},
 				},
-				State: map[string]any{},
-			},
-			Gateway:         gateway,
-			AccountStore:    store,
-			PollInterval:    time.Millisecond,
-			StreamReconnect: time.Millisecond,
-		})
-		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatal(err)
-		}
-		conformance.AssertRuntimeHealthState(t, store.state("account-health"), conformance.RuntimeHealthExpectation{
-			ConnectionState:       conformance.RuntimeHealthStateConnected,
-			RequireConnectedAt:    true,
-			RequireLastActivityAt: true,
-			RequireLastEventAt:    true,
-			RequireLastError:      true,
-			RequireLastErrorAt:    true,
-		})
-	})
-
-	t.Run("runtime health records expired poll session", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/ilink/bot/msg/notifystart", "/ilink/bot/msg/notifystop":
-				_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0})
-			case "/ilink/bot/getupdates":
-				_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0, "errcode": -14, "errmsg": "expired"})
-			default:
-				t.Fatalf("unexpected weixin request: %s %s", r.Method, r.URL.Path)
+				Gateway:         gateway,
+				AccountStore:    store,
+				PollInterval:    time.Millisecond,
+				StreamReconnect: time.Millisecond,
+			})
+			if errors.Is(err, context.DeadlineExceeded) {
+				err = nil
 			}
-		}))
-		defer server.Close()
+			return store.state("account-health"), err
+		},
+	}, {
+		Name:          "expired poll session is terminal",
+		Scenario:      conformance.SDKOwnedRuntimeScenarioSessionExpired,
+		RequireError:  true,
+		ErrorContains: "session expired",
+		Run: func(parent context.Context) (map[string]any, error) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/ilink/bot/msg/notifystart", "/ilink/bot/msg/notifystop":
+					_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0})
+				case "/ilink/bot/getupdates":
+					_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0, "errcode": -14, "errmsg": "expired"})
+				default:
+					t.Fatalf("unexpected weixin request: %s %s", r.Method, r.URL.Path)
+				}
+			}))
+			defer server.Close()
 
-		store := newWeixinStore()
-		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
-		defer cancel()
-		err := adapter.connector.Start(ctx, wechatsdk.Runtime{
-			WorkspaceUUID: "workspace-1",
-			Channel:       wechatsdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: beakweixin.Platform},
-			Account: wechatsdk.ChannelAccount{
-				UUID:          "account-expired",
+			store := newWeixinStore()
+			ctx, cancel := context.WithTimeout(parent, 40*time.Millisecond)
+			defer cancel()
+			err := adapter.connector.Start(ctx, wechatsdk.Runtime{
 				WorkspaceUUID: "workspace-1",
-				ChannelUUID:   "channel-1",
-				Platform:      beakweixin.Platform,
-				Credential: map[string]any{
-					"account_id":    "account-expired",
-					"bot_token":     "token-conformance",
-					"base_url":      server.URL,
-					"ilink_user_id": "ilink-user-conformance",
-					"ilink_bot_id":  "ilink-bot-conformance",
+				Channel:       wechatsdk.Channel{UUID: "channel-1", WorkspaceUUID: "workspace-1", Platform: beakweixin.Platform},
+				Account: wechatsdk.ChannelAccount{
+					UUID:          "account-expired",
+					WorkspaceUUID: "workspace-1",
+					ChannelUUID:   "channel-1",
+					Platform:      beakweixin.Platform,
+					Credential: map[string]any{
+						"account_id":    "account-expired",
+						"bot_token":     "token-conformance",
+						"base_url":      server.URL,
+						"ilink_user_id": "ilink-user-conformance",
+						"ilink_bot_id":  "ilink-bot-conformance",
+					},
+					State: map[string]any{},
 				},
-				State: map[string]any{},
-			},
-			Gateway:      &weixinGateway{},
-			AccountStore: store,
-		})
-		if err == nil || !strings.Contains(err.Error(), "session expired") {
-			t.Fatalf("expected expired session error, got %v", err)
-		}
-		trueValue := true
-		conformance.AssertRuntimeHealthState(t, store.state("account-expired"), conformance.RuntimeHealthExpectation{
-			ConnectionState:    conformance.RuntimeHealthStateExpired,
-			RequireLastError:   true,
-			RequireLastErrorAt: true,
-			SessionExpired:     &trueValue,
-		})
-	})
+				Gateway:      &weixinGateway{},
+				AccountStore: store,
+			})
+			return store.state("account-expired"), err
+		},
+	}}
 }
 
 type weixinAdapter struct {
@@ -2116,6 +2302,42 @@ func (a weixinAdapter) Acknowledge(ctx context.Context, req conformance.Outbound
 		return nil, err
 	}
 	out := convert[conformance.AckResult](a.t, result)
+	return &out, err
+}
+
+func (a weixinAdapter) Send(ctx context.Context, req conformance.OutboundMessage) (*conformance.SendResult, error) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ilink/bot/sendmessage" {
+			a.t.Fatalf("unexpected weixin send request: %s %s", r.Method, r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0})
+	}))
+	defer server.Close()
+
+	accountUUID := firstString(req.AccountUUID, "account-1")
+	account := wechatsdk.ChannelAccount{
+		UUID:     accountUUID,
+		Platform: beakweixin.Platform,
+		Credential: map[string]any{
+			"account_id":    accountUUID,
+			"bot_token":     "token-conformance",
+			"base_url":      server.URL,
+			"ilink_user_id": "ilink-user-conformance",
+			"ilink_bot_id":  "ilink-bot-conformance",
+		},
+		State: map[string]any{
+			"context_tokens": map[string]any{req.ChatID: "ctx-conformance"},
+		},
+	}
+	result, err := a.connector.Send(ctx, wechatsdk.Runtime{
+		Account:      account,
+		Accounts:     []wechatsdk.ChannelAccount{account},
+		AccountStore: newWeixinStore(),
+	}, convert[wechatsdk.OutboundMessage](a.t, req))
+	if result == nil {
+		return nil, err
+	}
+	out := convert[conformance.SendResult](a.t, result)
 	return &out, err
 }
 

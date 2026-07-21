@@ -3,6 +3,7 @@ package conformancetests
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -25,6 +26,7 @@ func runTeamsConformance(t *testing.T) {
 		CredentialValidator:      adapter,
 		InboundParser:            adapter,
 		Acknowledger:             adapter,
+		Sender:                   adapter,
 		CredentialCases: []conformance.CredentialValidationCase{{
 			Name: "valid client credentials",
 			Request: conformance.CredentialValidationRequest{
@@ -101,6 +103,14 @@ func runTeamsConformance(t *testing.T) {
 				Platform: beakteams.Platform, AccountUUID: "acct-1", ChatType: "group", ChatID: "C1", Mode: "reaction", Emoji: "eyes",
 			},
 			Expect: conformance.AckExpectation{Status: "unsupported", Mode: "reaction"},
+		}},
+		SendCases: []conformance.SendCase{{
+			Name: "text outbound exposes common send result",
+			Request: conformance.OutboundMessage{
+				AccountUUID: "acct-1", ChatType: "group", ChatID: "C1", MessageUUID: "message-send-teams",
+				Text: "Teams outbound", Format: "text",
+			},
+			Expect: conformance.SendExpectation{MessageID: "activity-conformance"},
 		}},
 	})
 }
@@ -245,6 +255,62 @@ func (a *teamsConformanceAdapter) Acknowledge(ctx context.Context, req conforman
 		Platform: result.Platform, AccountUUID: result.AccountUUID, Mode: result.Mode,
 		Status: result.Status, ReactionID: result.ReactionID, Raw: result.Raw,
 	}, nil
+}
+
+func (a *teamsConformanceAdapter) Send(ctx context.Context, req conformance.OutboundMessage) (*conformance.SendResult, error) {
+	account := teamssdk.ChannelAccount{
+		UUID:     req.AccountUUID,
+		Platform: beakteams.Platform,
+		Credential: map[string]any{
+			"account_id":    req.AccountUUID,
+			"client_id":     "app-id",
+			"client_secret": "secret",
+		},
+		State: map[string]any{
+			"service_urls": map[string]any{req.ChatID: "https://smba.trafficmanager.net/amer/"},
+		},
+	}
+	store := newTeamsConformanceStore()
+	if err := store.SaveChannelAccountState(ctx, account.UUID, account.State); err != nil {
+		return nil, err
+	}
+	result, err := a.conn.Send(ctx, teamssdk.Runtime{
+		Account:      account,
+		Accounts:     []teamssdk.ChannelAccount{account},
+		AccountStore: store,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(httpReq *http.Request) (*http.Response, error) {
+			switch {
+			case strings.Contains(httpReq.URL.Path, "/oauth2/v2.0/token"):
+				return jsonResponse(map[string]any{"access_token": "token", "expires_in": 3600})
+			case strings.Contains(httpReq.URL.Path, "/v3/conversations/") && strings.HasSuffix(httpReq.URL.Path, "/activities"):
+				return jsonResponse(map[string]any{"id": "activity-conformance"})
+			default:
+				return nil, fmt.Errorf("unexpected teams send request: %s %s", httpReq.Method, httpReq.URL.Path)
+			}
+		})},
+	}, teamssdk.OutboundMessage{
+		WorkspaceUUID: req.WorkspaceUUID, Platform: req.Platform, AccountUUID: req.AccountUUID,
+		ChannelUUID: req.ChannelUUID, SessionUUID: req.SessionUUID, MessageUUID: req.MessageUUID,
+		ChatType: req.ChatType, ChatID: req.ChatID, ThreadID: req.ThreadID, Text: req.Text,
+		Format: req.Format, Title: req.Title, Mentions: teamsSDKMentions(req.Mentions), MentionAll: req.MentionAll, Raw: req.Raw,
+	})
+	if result == nil {
+		return nil, err
+	}
+	return &conformance.SendResult{
+		Platform: result.Platform, AccountUUID: result.AccountUUID, MessageID: result.MessageID, Raw: result.Raw,
+	}, err
+}
+
+func teamsSDKMentions(mentions []conformance.MentionIdentity) []teamssdk.MentionIdentity {
+	if len(mentions) == 0 {
+		return nil
+	}
+	out := make([]teamssdk.MentionIdentity, len(mentions))
+	for i, mention := range mentions {
+		out[i] = teamssdk.MentionIdentity{ID: mention.ID, IDType: mention.IDType, DisplayName: mention.DisplayName}
+	}
+	return out
 }
 
 type teamsConformanceGateway struct{}

@@ -7,6 +7,7 @@ require (
 	github.com/GuanceCloud/beak-agent-channel-lark v0.0.0
 	github.com/GuanceCloud/beak-agent-channel-wechat v0.0.0
 	github.com/GuanceCloud/beak-agent-wecom v0.0.0
+	github.com/TrueWatchTech/truewatch-beak-agent-channel-slack v0.0.0-00010101000000-000000000000
 	github.com/TrueWatchTech/truewatch-beak-agent-channel-slack/conformance v0.0.0
 	github.com/TrueWatchTech/truewatch-beak-agent-channel-teams v0.0.0
 	github.com/TrueWatchTech/truewatch-beak-agent-channel-telegram v0.0.0
@@ -17,7 +18,6 @@ require (
 )
 
 require (
-	github.com/TrueWatchTech/truewatch-beak-agent-channel-slack v0.0.0-00010101000000-000000000000 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/google/uuid v1.3.0 // indirect
 )

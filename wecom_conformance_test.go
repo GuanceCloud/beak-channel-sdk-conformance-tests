@@ -3,6 +3,7 @@ package conformancetests
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -35,6 +36,7 @@ func runWeComConformance(t *testing.T) {
 		CredentialValidator:      adapter,
 		InboundParser:            adapter,
 		Acknowledger:             adapter,
+		Sender:                   adapter,
 		HostStreamer:             adapter,
 		CredentialCases: []conformance.CredentialValidationCase{{
 			Name: "valid bot credential uses websocket authentication",
@@ -134,6 +136,43 @@ func runWeComConformance(t *testing.T) {
 			},
 			Expect: conformance.AckExpectation{Status: "unsupported", Mode: "auto"},
 		}},
+		SendCases: []conformance.SendCase{{
+			Name: "markdown outbound exposes common send result",
+			Request: conformance.OutboundMessage{
+				AccountUUID: "account-1", ChatType: conformance.ChatTypeDirect, ChatID: "user-1",
+				MessageUUID: "message-send-wecom", Text: "**WeCom outbound**", Format: "markdown",
+			},
+			Expect: conformance.SendExpectation{
+				MessageID: "wecom-message-conformance", RequiredRawKeys: []string{"message_ids", "delivery_method", "chunk_count"},
+			},
+		}, {
+			Name: "multipart retry resumes without duplicate chunks",
+			Steps: []conformance.SendStep{{
+				Name: "second chunk fails",
+				Request: conformance.OutboundMessage{
+					AccountUUID: "account-multipart", ChatType: conformance.ChatTypeDirect, ChatID: "user-1",
+					MessageUUID: "message-multipart-wecom", Text: strings.Repeat("你", 10000), Format: "markdown",
+					Raw: map[string]any{"conformance_scenario": "multipart_resume"},
+				},
+				Expect: conformance.SendExpectation{RequireError: true, ErrorContains: "temporary stream failure"},
+			}, {
+				Name: "retry resumes failed chunk",
+				Request: conformance.OutboundMessage{
+					AccountUUID: "account-multipart", ChatType: conformance.ChatTypeDirect, ChatID: "user-1",
+					MessageUUID: "message-multipart-wecom", Text: strings.Repeat("你", 10000), Format: "markdown",
+					Raw: map[string]any{"conformance_scenario": "multipart_resume"},
+				},
+				Expect: conformance.SendExpectation{RequireMessageID: true, RequiredRawKeys: []string{"message_ids", "chunk_count"}},
+			}, {
+				Name: "message uuid rejects changed payload",
+				Request: conformance.OutboundMessage{
+					AccountUUID: "account-multipart", ChatType: conformance.ChatTypeDirect, ChatID: "user-1",
+					MessageUUID: "message-multipart-wecom", Text: strings.Repeat("你", 10000) + " changed", Format: "markdown",
+					Raw: map[string]any{"conformance_scenario": "multipart_resume"},
+				},
+				Expect: conformance.SendExpectation{RequireError: true, ErrorContains: "different outbound payload"},
+			}},
+		}},
 		HostStreamCases: []conformance.HostStreamCase{{
 			Name: "authenticate, heartbeat, and receive callback",
 			Request: conformance.HostStreamConnectRequest{
@@ -221,6 +260,8 @@ type wecomAdapter struct {
 	mu         sync.Mutex
 	authID     string
 	pingID     string
+	sendStore  *wecomStore
+	retrySend  *wecomRetrySendTransport
 }
 
 func newWeComAdapter(t *testing.T) *wecomAdapter {
@@ -232,7 +273,11 @@ func newWeComAdapter(t *testing.T) *wecomAdapter {
 	if !ok {
 		t.Fatal("wecom connector should expose HostStreamConnector")
 	}
-	return &wecomAdapter{t: t, connector: connector, hostStream: hostStream, endpoint: endpoint}
+	return &wecomAdapter{
+		t: t, connector: connector, hostStream: hostStream, endpoint: endpoint,
+		sendStore: &wecomStore{values: map[string]map[string]any{}},
+		retrySend: &wecomRetrySendTransport{t: t},
+	}
 }
 
 func (a *wecomAdapter) Metadata() conformance.ConnectorMetadata {
@@ -281,6 +326,26 @@ func (a *wecomAdapter) Acknowledge(ctx context.Context, req conformance.Outbound
 		return nil, err
 	}
 	out := convert[conformance.AckResult](a.t, result)
+	return &out, err
+}
+
+func (a *wecomAdapter) Send(ctx context.Context, req conformance.OutboundMessage) (*conformance.SendResult, error) {
+	account := wecomAccount(req.AccountUUID, req.WorkspaceUUID, req.ChannelUUID, wecomCredential(), map[string]any{})
+	store := &wecomStore{values: map[string]map[string]any{}}
+	var transport wecomsdk.StreamTransport = wecomSendTransport{t: a.t}
+	if req.Raw["conformance_scenario"] == "multipart_resume" {
+		store = a.sendStore
+		transport = a.retrySend
+	}
+	result, err := a.connector.Send(ctx, wecomsdk.Runtime{
+		Account: account, Accounts: []wecomsdk.ChannelAccount{account},
+		AccountStore: store,
+		Stream:       transport,
+	}, convert[wecomsdk.OutboundMessage](a.t, req))
+	if result == nil {
+		return nil, err
+	}
+	out := convert[conformance.SendResult](a.t, result)
 	return &out, err
 }
 
@@ -463,6 +528,62 @@ func (*wecomGateway) BridgeParticipantID(platform string) string {
 type wecomStore struct {
 	mu     sync.Mutex
 	values map[string]map[string]any
+}
+
+type wecomSendTransport struct {
+	t *testing.T
+}
+
+type wecomRetrySendTransport struct {
+	t        *testing.T
+	mu       sync.Mutex
+	contents []string
+}
+
+func (s *wecomRetrySendTransport) Request(_ context.Context, req wecomsdk.StreamRequest) (*wecomsdk.StreamResponse, error) {
+	frame, err := parseWeComTestFrame(req.Frame.Data)
+	if err != nil {
+		return nil, err
+	}
+	markdown, _ := frame.Body["markdown"].(map[string]any)
+	content := stringValue(markdown["content"])
+	s.mu.Lock()
+	s.contents = append(s.contents, content)
+	call := len(s.contents)
+	contents := append([]string(nil), s.contents...)
+	s.mu.Unlock()
+	if call == 2 {
+		return nil, errors.New("temporary stream failure")
+	}
+	if call == 3 && (contents[2] != contents[1] || contents[2] == contents[0]) {
+		return nil, errors.New("multipart retry did not resume the failed chunk")
+	}
+	ack := mustWeComFrame(s.t, wecomTestFrame{
+		Headers: wecomTestFrameHeaders{RequestID: req.CorrelationID},
+		Body:    map[string]any{"msgid": "wecom-message-multipart"},
+	})
+	return &wecomsdk.StreamResponse{
+		Frame:         wecomsdk.StreamFrame{MessageType: wecomsdk.StreamMessageTypeText, Data: ack},
+		CorrelationID: req.CorrelationID,
+	}, nil
+}
+
+func (s wecomSendTransport) Request(_ context.Context, req wecomsdk.StreamRequest) (*wecomsdk.StreamResponse, error) {
+	frame, err := parseWeComTestFrame(req.Frame.Data)
+	if err != nil {
+		return nil, err
+	}
+	if frame.Headers.RequestID != req.CorrelationID {
+		s.t.Fatalf("wecom send correlation id = %q, want %q", frame.Headers.RequestID, req.CorrelationID)
+	}
+	ack := mustWeComFrame(s.t, wecomTestFrame{
+		Headers: wecomTestFrameHeaders{RequestID: req.CorrelationID},
+		Body:    map[string]any{"msgid": "wecom-message-conformance"},
+	})
+	return &wecomsdk.StreamResponse{
+		Frame:         wecomsdk.StreamFrame{MessageType: wecomsdk.StreamMessageTypeText, Data: ack},
+		CorrelationID: req.CorrelationID,
+	}, nil
 }
 
 func (s *wecomStore) LoadChannelAccountState(_ context.Context, accountUUID string) (map[string]any, error) {
