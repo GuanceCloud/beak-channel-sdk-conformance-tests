@@ -1004,14 +1004,15 @@ func runLarkConformance(t *testing.T) {
 
 	t.Run("feishu runtime platform remains beak-facing", func(t *testing.T) {
 		conformance.Run(t, conformance.Config{
-			Platform:            "feishu",
-			MetadataPlatform:    beaklark.Platform,
-			MetadataProvider:    adapter,
-			CredentialValidator: adapter,
-			InboundParser:       adapter,
-			Acknowledger:        adapter,
-			Sender:              adapter,
-			HostStreamer:        adapter,
+			Platform:                 "feishu",
+			MetadataPlatform:         beaklark.Platform,
+			MetadataProvider:         adapter,
+			CredentialSchemaProvider: adapter,
+			CredentialValidator:      adapter,
+			InboundParser:            adapter,
+			Acknowledger:             adapter,
+			Sender:                   adapter,
+			HostStreamer:             adapter,
 			CredentialCases: []conformance.CredentialValidationCase{{
 				Name: "valid feishu credential exposes feishu metadata platform",
 				Request: conformance.CredentialValidationRequest{
@@ -1277,7 +1278,7 @@ func newLarkAdapter(t *testing.T) larkAdapter {
 					t.Fatal(err)
 				}
 				if body["app_secret"] == "bad" {
-					return jsonResponse(map[string]any{"code": 999, "msg": "bad secret"})
+					return jsonResponse(map[string]any{"code": 10015, "msg": "bad secret"})
 				}
 				return jsonResponse(map[string]any{"code": 0, "tenant_access_token": "tenant-token-conformance", "expire": 3600})
 			case "/callback/ws/endpoint":
@@ -1804,10 +1805,20 @@ func (s *larkStore) state(accountUUID string) map[string]any {
 
 func runWeixinConformance(t *testing.T) {
 	adapter := newWeixinAdapter(t)
-	defer adapter.loginSrv.Close()
+	defer adapter.Close()
 
 	trueValue := true
 	falseValue := false
+	multipartRequest := conformance.OutboundMessage{
+		AccountUUID: "account-1",
+		MessageUUID: "message-send-weixin-multipart",
+		ChatType:    conformance.ChatTypeDirect,
+		ChatID:      "user-conformance",
+		Text:        weixinMultipartText,
+		Format:      "text",
+	}
+	changedMultipartRequest := multipartRequest
+	changedMultipartRequest.Text = strings.Repeat("甲", 2000) + strings.Repeat("丙", 100)
 
 	conformance.Run(t, conformance.Config{
 		Platform:                 beakweixin.Platform,
@@ -1982,6 +1993,29 @@ func runWeixinConformance(t *testing.T) {
 				Text:        "Weixin outbound",
 				Format:      "text",
 			},
+		}, {
+			Name: "multipart outbound resumes without duplicating completed chunks",
+			Steps: []conformance.SendStep{{
+				Name:    "middle chunk fails",
+				Request: multipartRequest,
+				Expect: conformance.SendExpectation{
+					RequireError:  true,
+					ErrorContains: "temporary multipart failure",
+				},
+			}, {
+				Name:    "same payload resumes",
+				Request: multipartRequest,
+				Expect: conformance.SendExpectation{
+					RequiredRawKeys: []string{"chunk_count", "client_ids", "resumed"},
+				},
+			}, {
+				Name:    "same message uuid rejects changed payload",
+				Request: changedMultipartRequest,
+				Expect: conformance.SendExpectation{
+					RequireError:  true,
+					ErrorContains: "different outbound payload",
+				},
+			}},
 		}},
 	})
 }
@@ -2114,7 +2148,10 @@ type weixinAdapter struct {
 	connector  wechatsdk.Connector
 	httpClient *http.Client
 	loginSrv   *httptest.Server
+	send       *weixinSendHarness
 }
+
+var weixinMultipartText = strings.Repeat("甲", 2000) + strings.Repeat("乙", 100)
 
 func newWeixinAdapter(t *testing.T) weixinAdapter {
 	t.Helper()
@@ -2147,7 +2184,13 @@ func newWeixinAdapter(t *testing.T) weixinAdapter {
 			Transport: rewriteTransport{target: targetURL, base: http.DefaultTransport},
 		},
 		loginSrv: loginSrv,
+		send:     newWeixinSendHarness(t),
 	}
+}
+
+func (a weixinAdapter) Close() {
+	a.loginSrv.Close()
+	a.send.Close()
 }
 
 func (a weixinAdapter) Metadata() conformance.ConnectorMetadata {
@@ -2306,14 +2349,6 @@ func (a weixinAdapter) Acknowledge(ctx context.Context, req conformance.Outbound
 }
 
 func (a weixinAdapter) Send(ctx context.Context, req conformance.OutboundMessage) (*conformance.SendResult, error) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/ilink/bot/sendmessage" {
-			a.t.Fatalf("unexpected weixin send request: %s %s", r.Method, r.URL.Path)
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0})
-	}))
-	defer server.Close()
-
 	accountUUID := firstString(req.AccountUUID, "account-1")
 	account := wechatsdk.ChannelAccount{
 		UUID:     accountUUID,
@@ -2321,7 +2356,7 @@ func (a weixinAdapter) Send(ctx context.Context, req conformance.OutboundMessage
 		Credential: map[string]any{
 			"account_id":    accountUUID,
 			"bot_token":     "token-conformance",
-			"base_url":      server.URL,
+			"base_url":      a.send.server.URL,
 			"ilink_user_id": "ilink-user-conformance",
 			"ilink_bot_id":  "ilink-bot-conformance",
 		},
@@ -2329,16 +2364,78 @@ func (a weixinAdapter) Send(ctx context.Context, req conformance.OutboundMessage
 			"context_tokens": map[string]any{req.ChatID: "ctx-conformance"},
 		},
 	}
+	a.send.store.merge(accountUUID, account.State)
 	result, err := a.connector.Send(ctx, wechatsdk.Runtime{
 		Account:      account,
 		Accounts:     []wechatsdk.ChannelAccount{account},
-		AccountStore: newWeixinStore(),
+		AccountStore: a.send.store,
 	}, convert[wechatsdk.OutboundMessage](a.t, req))
 	if result == nil {
 		return nil, err
 	}
 	out := convert[conformance.SendResult](a.t, result)
 	return &out, err
+}
+
+type weixinSendHarness struct {
+	t                *testing.T
+	server           *httptest.Server
+	store            *weixinStore
+	mu               sync.Mutex
+	failedSecondOnce bool
+	firstChunkCalls  int
+}
+
+func newWeixinSendHarness(t *testing.T) *weixinSendHarness {
+	harness := &weixinSendHarness{t: t, store: newWeixinStore()}
+	harness.server = httptest.NewServer(http.HandlerFunc(harness.handle))
+	return harness
+}
+
+func (h *weixinSendHarness) Close() {
+	h.server.Close()
+}
+
+func (h *weixinSendHarness) handle(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/ilink/bot/sendmessage" {
+		h.t.Errorf("unexpected weixin send request: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	var body struct {
+		Message struct {
+			ItemList []struct {
+				TextItem struct {
+					Text string `json:"text"`
+				} `json:"text_item"`
+			} `json:"item_list"`
+		} `json:"msg"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		h.t.Errorf("decode weixin send request: %v", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	text := ""
+	if len(body.Message.ItemList) > 0 {
+		text = body.Message.ItemList[0].TextItem.Text
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if text == strings.Repeat("甲", 2000) {
+		h.firstChunkCalls++
+		if h.firstChunkCalls > 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ret": 1, "errmsg": "completed first chunk was sent twice"})
+			return
+		}
+	}
+	if text == strings.Repeat("乙", 100) && !h.failedSecondOnce {
+		h.failedSecondOnce = true
+		_ = json.NewEncoder(w).Encode(map[string]any{"ret": 1, "errmsg": "temporary multipart failure"})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0})
 }
 
 type rewriteTransport struct {
@@ -2423,14 +2520,22 @@ func newWeixinStore() *weixinStore {
 func (s *weixinStore) LoadChannelAccountState(_ context.Context, accountUUID string) (map[string]any, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.states[accountUUID], nil
+	return cloneWeixinMap(s.states[accountUUID]), nil
 }
 
 func (s *weixinStore) SaveChannelAccountState(_ context.Context, accountUUID string, state map[string]any) error {
+	s.merge(accountUUID, state)
+	return nil
+}
+
+func (s *weixinStore) merge(accountUUID string, state map[string]any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.states[accountUUID] = state
-	return nil
+	merged := cloneWeixinMap(s.states[accountUUID])
+	for key, value := range state {
+		merged[key] = value
+	}
+	s.states[accountUUID] = merged
 }
 
 func (s *weixinStore) state(accountUUID string) map[string]any {
@@ -2439,6 +2544,14 @@ func (s *weixinStore) state(accountUUID string) map[string]any {
 	out := make(map[string]any, len(s.states[accountUUID]))
 	for key, value := range s.states[accountUUID] {
 		out[key] = value
+	}
+	return out
+}
+
+func cloneWeixinMap(value map[string]any) map[string]any {
+	out := make(map[string]any, len(value))
+	for key, item := range value {
+		out[key] = item
 	}
 	return out
 }
