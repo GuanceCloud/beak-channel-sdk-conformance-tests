@@ -48,3 +48,31 @@ func TestSDKTypesStayInSync(t *testing.T) {
 		})
 	}
 }
+
+func TestInteractionContractsStayInSync(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve conformance test path")
+	}
+	root := filepath.Dir(filepath.Dir(currentFile))
+	paths, err := filepath.Glob(filepath.Join(root, "*", "sdk", "interaction.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 7 {
+		t.Fatalf("expected seven interaction contracts, got %d", len(paths))
+	}
+	canonical, err := os.ReadFile(paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths[1:] {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(canonical, data) {
+			t.Fatalf("interaction contract drift: %s", path)
+		}
+	}
+}
